@@ -1,0 +1,20 @@
+services:
+
+  # Two identical instances of your Rust app.
+  # Docker Compose gives each one a hostname matching its service name (api-1, api-2).
+  # They are NOT exposed to the host — only nginx can reach them.
+  api-1:
+    build: .
+
+  api-2:
+    build: .
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "9999:9999"          # host:container — your clients hit localhost:9999
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro   # mount your config into the container
+    depends_on:
+      - api-1
+      - api-2
