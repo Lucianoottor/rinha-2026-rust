@@ -12,8 +12,7 @@ pub struct Config {
     pub max_merchant_avg_amount: f64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug)]
 pub struct Data {
     pub id: String,
     pub transaction: Transaction,
@@ -23,42 +22,43 @@ pub struct Data {
     pub last_transaction: Option<LastTransaction>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug)]
 pub struct Transaction {
     pub amount: f64,
     pub installments: u32,
     pub requested_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug)]
 pub struct Customer {
     pub avg_amount: f64,
     pub tx_count_24h: u32,
     pub known_merchants: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug)]
 pub struct Merchant {
     pub id: String,
     pub mcc: String,
     pub avg_amount: f64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug)]
 pub struct Terminal {
     pub is_online: bool,
     pub card_present: bool,
     pub km_from_home: f64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug)]
 pub struct LastTransaction {
     pub timestamp: DateTime<Utc>,
     pub km_from_current: f64,
 }
 
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RawData {
+    pub vector: Vec<f32>,
+    pub label: String
+}
