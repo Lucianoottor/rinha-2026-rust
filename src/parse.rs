@@ -3,18 +3,17 @@ use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use crate::traits::Loader;
 use crate::types::{Data, RawData};
 
 pub struct DataLoader;
 
-impl Loader for DataLoader {
-    fn load_data(&self, file_path: &str) -> Vec<Data> {
+impl DataLoader {
+    pub fn load_data(&self, file_path: &str) -> Vec<Data> {
         let file_content = std::fs::read_to_string(file_path).unwrap();
         let data: Vec<Data> = serde_json::from_str(&file_content).unwrap();
         data
     }
-    fn load_train_data(file_path: &str) -> Vec<RawData> {
+    pub fn load_train_data(file_path: &str) -> Vec<RawData> {
         use std::fs::File;
         use std::io::BufReader;
         use flate2::read::GzDecoder;

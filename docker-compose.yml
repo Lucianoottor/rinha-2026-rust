@@ -7,8 +7,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "1000M"
+          cpus: "0.475"
+          memory: "1165M"
 
   api-2:
     platform: linux/amd64
@@ -18,8 +18,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "1000M"
+          cpus: "0.475"
+          memory: "1165M"
 
   nginx:
     platform: linux/amd64
@@ -34,5 +34,5 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
-          memory: "100M"
+          cpus: "0.05"
+          memory: "20M"

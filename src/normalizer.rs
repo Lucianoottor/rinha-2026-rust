@@ -1,87 +1,168 @@
-use chrono::{Datelike, Timelike};
-use crate::traits::Normalizer;
-use crate::types::*;
+use crate::input::Payload;
 
 #[inline(always)]
-fn comp_mcc(mcc: &str) -> f32 {
+fn comp_mcc(mcc: &[u8]) -> f32 {
     match mcc {
-    "5411" => 0.15,
-    "5812" => 0.30,
-    "5912" => 0.20,
-    "5944" => 0.45,
-    "7801" => 0.80,
-    "7802" => 0.75,
-    "7995" => 0.85,
-    "4511" => 0.35,
-    "5311" => 0.25,
-    "5999" => 0.50,
-    _ => 0.50
+        b"5411" => 0.15,
+        b"5812" => 0.30,
+        b"5912" => 0.20,
+        b"5944" => 0.45,
+        b"7801" => 0.80,
+        b"7802" => 0.75,
+        b"7995" => 0.85,
+        b"4511" => 0.35,
+        b"5311" => 0.25,
+        b"5999" => 0.50,
+        _ => 0.50,
     }
 }
 
 #[inline(always)]
-fn clamp(val: f64, max: f64) -> f32 {
-    (val / max).min(1.0).max(0.0) as f32
+fn clamp(val: f32, max: f32) -> f32 {
+    (val / max).min(1.0).max(0.0)
+}
+
+#[inline(always)]
+fn b2(b: &[u8]) -> u32 {
+    (b[0] - b'0') as u32 * 10 + (b[1] - b'0') as u32
+}
+
+#[inline(always)]
+fn b4(b: &[u8]) -> u32 {
+    (b[0] - b'0') as u32 * 1000
+        + (b[1] - b'0') as u32 * 100
+        + (b[2] - b'0') as u32 * 10
+        + (b[3] - b'0') as u32
+}
+
+
+#[inline]
+fn ymd_to_days(y: u32, m: u32, d: u32) -> i64 {
+    let a = (14 - m) / 12;
+    let yr = (y + 4800 - a) as i64;
+    let mo = (m + 12 * a - 3) as i64;
+    d as i64 + (153 * mo + 2) / 5 + 365 * yr + yr / 4 - yr / 100 + yr / 400 - 32045
+}
+
+#[inline]
+fn ts_to_minutes(b: &[u8]) -> i64 {
+    ymd_to_days(b4(&b[0..4]), b2(&b[5..7]), b2(&b[8..10])) * 1440
+        + b2(&b[11..13]) as i64 * 60
+        + b2(&b[14..16]) as i64
+}
+
+
+#[inline(always)]
+fn ts_hour(b: &[u8]) -> f32 {
+    b2(&b[11..13]) as f32 / 23.0
+}
+
+#[inline]
+fn ts_weekday(b: &[u8]) -> f32 {
+    const T: [u32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = b4(&b[0..4]);
+    let m = b2(&b[5..7]);
+    let d = b2(&b[8..10]);
+    let yr = if m < 3 { y - 1 } else { y };
+    let dow = (yr + yr / 4 - yr / 100 + yr / 400 + T[(m - 1) as usize] + d) % 7;
+    ((dow + 6) % 7) as f32 / 6.0
 }
 
 pub struct DataNormalizer;
 
-impl Normalizer for DataNormalizer {
-    fn normalize(&self, data: &Data) -> Vec<f32> {
+impl DataNormalizer {
+    pub fn normalize(&self, data: &Payload<'_>) -> Vec<f32> {
         let mut v = Vec::with_capacity(14);
 
         // 0: amount
-        v.push(clamp(data.transaction.amount, 10000.0));
+        v.push(clamp(data.amount, 10000.0));
 
         // 1: installments
-        v.push(clamp(data.transaction.installments as f64, 12.0));
+        v.push(clamp(data.installments as f32, 12.0));
 
         // 2: amount_vs_avg
-        let ratio = if data.customer.avg_amount > 0.0 {
-            data.transaction.amount / data.customer.avg_amount
+        let ratio = if data.customer_avg_amount > 0.0 {
+            data.amount / data.customer_avg_amount
         } else {
             0.0
         };
         v.push(clamp(ratio, 10.0));
 
         // 3: hour_of_day
-        v.push((data.transaction.requested_at.hour() as f32) / 23.0);
+        v.push(ts_hour(data.requested_at));
 
         // 4: day_of_week
-        v.push((data.transaction.requested_at.weekday().num_days_from_monday() as f32) / 6.0);
+        v.push(ts_weekday(data.requested_at));
 
-        // 5 & 6: Last Transaction logic (minutes and km)
-        if let Some(last) = &data.last_transaction {
-            let duration = data.transaction.requested_at.signed_duration_since(last.timestamp);
-            v.push(clamp(duration.num_minutes() as f64, 1440.0));
-            v.push(clamp(last.km_from_current, 1000.0));
-        } else {
-            v.push(-1.0);
-            v.push(-1.0);
+        // 5 & 6: last transaction timing and distance
+        match (data.last_timestamp, data.last_km) {
+            (Some(ts), Some(km)) => {
+                let minutes = ts_to_minutes(data.requested_at) - ts_to_minutes(ts);
+                v.push(clamp(minutes as f32, 1440.0));
+                v.push(clamp(km, 1000.0));
+            }
+            _ => {
+                v.push(-1.0);
+                v.push(-1.0);
+            }
         }
 
         // 7: km_from_home
-        v.push(clamp(data.terminal.km_from_home, 1000.0));
+        v.push(clamp(data.km_from_home, 1000.0));
 
         // 8: tx_count_24h
-        v.push(clamp(data.customer.tx_count_24h as f64, 20.0));
+        v.push(clamp(data.tx_count_24h as f32, 20.0));
 
         // 9: is_online
-        v.push(if data.terminal.is_online { 1.0 } else { 0.0 });
+        v.push(if data.is_online { 1.0 } else { 0.0 });
 
         // 10: card_present
-        v.push(if data.terminal.card_present { 1.0 } else { 0.0 });
+        v.push(if data.card_present { 1.0 } else { 0.0 });
 
         // 11: unknown_merchant
-        let is_known = data.customer.known_merchants.contains(&data.merchant.id);
+        let id = data.merchant_id;
+        let is_known = data.known_merchants
+            .windows(id.len() + 2)
+            .any(|w| w[0] == b'"' && &w[1..w.len() - 1] == id && w[w.len() - 1] == b'"');
         v.push(if is_known { 0.0 } else { 1.0 });
 
         // 12: mcc_risk
-        v.push(comp_mcc(data.merchant.mcc.as_str()));
+        v.push(comp_mcc(data.merchant_mcc));
 
         // 13: merchant_avg_amount
-        v.push(clamp(data.merchant.avg_amount, 10000.0));
+        v.push(clamp(data.merchant_avg_amount, 10000.0));
 
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ts_hour() {
+        // 18:45 → 18/23
+        assert_eq!(ts_hour(b"2026-03-11T18:45:53Z"), 18.0 / 23.0);
+        assert_eq!(ts_hour(b"2026-03-11T00:00:00Z"), 0.0);
+        assert_eq!(ts_hour(b"2026-03-11T23:59:59Z"), 1.0);
+    }
+
+    #[test]
+    fn test_ts_weekday() {
+        // 2026-03-11 is a Wednesday → num_days_from_monday = 2
+        assert_eq!(ts_weekday(b"2026-03-11T00:00:00Z"), 2.0 / 6.0);
+        // 2026-03-09 is a Monday → 0
+        assert_eq!(ts_weekday(b"2026-03-09T00:00:00Z"), 0.0 / 6.0);
+        // 2026-03-15 is a Sunday → 6
+        assert_eq!(ts_weekday(b"2026-03-15T00:00:00Z"), 6.0 / 6.0);
+    }
+
+    #[test]
+    fn test_ts_minutes_diff() {
+        // 20:23 - 14:58 on the same day = 325 minutes
+        let a = b"2026-03-11T20:23:35Z";
+        let b = b"2026-03-11T14:58:35Z";
+        assert_eq!(ts_to_minutes(a) - ts_to_minutes(b), 325);
     }
 }

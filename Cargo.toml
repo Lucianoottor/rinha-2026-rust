@@ -9,4 +9,6 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1.0"
 monoio = "0.2"
+instant-distance = "0.6"
+fast-float = "0.2"
 kiddo = "5.3.1" 
