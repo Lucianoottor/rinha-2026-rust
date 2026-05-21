@@ -16,7 +16,7 @@ pub struct Payload<'a> {
 }
 
 
-
+// IA gerou as const de comparacao - fara o match com o inicio da word para aplicar jump e evitar leitura de chars
 const K_ID: u64          = u64::from_le_bytes([b'i', b'd',  0,   0,   0,   0,   0,   0  ]);
 const K_TRANSACTION: u64 = u64::from_le_bytes([b't', b'r', b'a', b'n', b's', b'a', b'c', b't']);
 const K_CUSTOMER: u64    = u64::from_le_bytes([b'c', b'u', b's', b't', b'o', b'm', b'e', b'r']);
@@ -55,16 +55,15 @@ const K_KM_FROM: u64     = u64::from_le_bytes([b'k', b'm', b'_', b'f', b'r', b'o
 // "timestamp" → first 8 = "timestam"
 const K_TIMESTAMP: u64   = u64::from_le_bytes([b't', b'i', b'm', b'e', b's', b't', b'a', b'm']);
 
-// ── SWAR helper ──────────────────────────────────────────────────────────────
 
-/// Returns non-zero if any byte in the 8-byte word equals `needle`.
+// https://graphics.stanford.edu/~seander/bithacks.html#ZeroInWord
+// identifica se o char esta presente no conjunto x
 #[inline(always)]
 fn has_byte(x: u64, needle: u8) -> bool {
     let v = x ^ (0x0101_0101_0101_0101_u64.wrapping_mul(needle as u64));
     v.wrapping_sub(0x0101_0101_0101_0101_u64) & !v & 0x8080_8080_8080_8080_u64 != 0
 }
 
-// ── Runtime key hasher ────────────────────────────────────────────────────────
 
 #[inline(always)]
 fn key_hash(b: &[u8]) -> u64 {
@@ -73,8 +72,6 @@ fn key_hash(b: &[u8]) -> u64 {
     arr[..n].copy_from_slice(&b[..n]);
     u64::from_le_bytes(arr)
 }
-
-// ── Scanner ───────────────────────────────────────────────────────────────────
 
 struct Scanner<'a> {
     buf: &'a [u8],
@@ -107,16 +104,12 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Reads string content after the opening `"` has been consumed.
-    /// Uses SWAR to scan 8 bytes at a time for `"` or `\`.
-    /// Leaves `pos` after the closing `"`.
     #[inline]
     fn scan_str_content(&mut self) -> Option<&'a [u8]> {
         let buf = self.buf;
         let start = self.pos;
         let mut i = start;
 
-        // SWAR fast path: skip 8 bytes at a time when there's no `"` or `\`
         while i + 8 <= buf.len() {
             let chunk = unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() };
             if has_byte(chunk, b'"') || has_byte(chunk, b'\\') {
@@ -125,7 +118,6 @@ impl<'a> Scanner<'a> {
             i += 8;
         }
 
-        // Scalar tail with escape handling
         loop {
             let b = *buf.get(i)?;
             if b == b'"' {
@@ -136,14 +128,11 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Reads a `"string"` value and returns the inner content slice.
     #[inline]
     fn read_str(&mut self) -> Option<&'a [u8]> {
         self.expect(b'"')?;
         self.scan_str_content()
     }
-
-    /// Reads a JSON key `"..."` and returns `(first-8-byte hash, key length)`.
     #[inline]
     fn read_key(&mut self) -> Option<(u64, usize)> {
         self.expect(b'"')?;
@@ -163,7 +152,6 @@ impl<'a> Scanner<'a> {
         hit.then_some(n)
     }
 
-    /// Parses a float using fast-float's partial parser (no pre-scan needed).
     #[inline]
     fn parse_f32(&mut self) -> Option<f32> {
         let (val, consumed) = fast_float::parse_partial::<f32, _>(&self.buf[self.pos..]).ok()?;
@@ -180,13 +168,11 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Returns `true` and advances past `null` if current token is `null`.
     #[inline]
     fn try_null(&mut self) -> bool {
         if self.peek() == Some(b'n') { self.pos += 4; true } else { false }
     }
 
-    /// Captures the raw `[...]` slice including brackets.
     fn slice_array(&mut self) -> Option<&'a [u8]> {
         let start = self.pos;
         self.skip_array()?;
@@ -249,8 +235,7 @@ impl<'a> Scanner<'a> {
         Some(())
     }
 
-    // ── Sub-object parsers ───────────────────────────────────────────────────
-
+ 
     fn parse_transaction(&mut self) -> Option<(f32, u32, &'a [u8])> {
         self.expect(b'{')?;
         let mut amount = None::<f32>;
@@ -266,6 +251,8 @@ impl<'a> Scanner<'a> {
             }
             let (h, klen) = self.read_key()?;
             self.skip_ws(); self.expect(b':')?; self.skip_ws();
+
+            // compara com as const no inicio do codigo - se encontrar, pula os chars que ja sabemos quais sao e nao precisam ser lidos
             match (h, klen) {
                 (K_AMOUNT,     6)  => amount       = Some(self.parse_f32()?),
                 (K_INSTALLM,   12) => installments = Some(self.parse_u32()?),
@@ -375,7 +362,6 @@ impl<'a> Scanner<'a> {
     }
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn parse_payload(req_body: &[u8]) -> Option<Payload<'_>> {
     let mut s = Scanner::new(req_body);
