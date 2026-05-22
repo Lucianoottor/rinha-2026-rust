@@ -1,0 +1,6 @@
+# Enable AVX2 + FMA for the Linux x86_64 release target.
+# This makes the `cfg!(target_feature = "avx2")` checks in hnsw_static.rs
+# resolve at compile time, so the distance kernel emits 2× VSUB + VFMADD
+# with no runtime dispatch overhead.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+fma"]

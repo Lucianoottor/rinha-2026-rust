@@ -1,5 +1,74 @@
 use crate::input::Payload;
 
+pub struct DataNormalizer;
+
+impl DataNormalizer {
+    pub fn normalize(&self, data: &Payload<'_>) -> [f32; 16] {
+        let mut v = [0.0f32; 16];
+
+        // 0: amount
+        v[0] = clamp(data.amount, 10000.0);
+
+        // 1: installments
+        v[1] = clamp(data.installments as f32, 12.0);
+
+        // 2: amount_vs_avg
+        let ratio = if data.customer_avg_amount > 0.0 {
+            data.amount / data.customer_avg_amount
+        } else {
+            0.0
+        };
+        v[2] = clamp(ratio, 10.0);
+
+        // 3: hour_of_day
+        v[3] = ts_hour(data.requested_at);
+
+        // 4: day_of_week
+        v[4] = ts_weekday(data.requested_at);
+
+        // 5 & 6: last transaction timing and distance
+        match (data.last_timestamp, data.last_km) {
+            (Some(ts), Some(km)) => {
+                let minutes = ts_to_minutes(data.requested_at) - ts_to_minutes(ts);
+                v[5] = clamp(minutes as f32, 1440.0);
+                v[6] = clamp(km, 1000.0);
+            }
+            _ => {
+                v[5] = -1.0;
+                v[6] = -1.0;
+            }
+        }
+
+        // 7: km_from_home
+        v[7] = clamp(data.km_from_home, 1000.0);
+
+        // 8: tx_count_24h
+        v[8] = clamp(data.tx_count_24h as f32, 20.0);
+
+        // 9: is_online
+        v[9] = if data.is_online { 1.0 } else { 0.0 };
+
+        // 10: card_present
+        v[10] = if data.card_present { 1.0 } else { 0.0 };
+
+        // 11: unknown_merchant
+        let id = data.merchant_id;
+        let is_known = data.known_merchants
+            .windows(id.len() + 2)
+            .any(|w| w[0] == b'"' && &w[1..w.len() - 1] == id && w[w.len() - 1] == b'"');
+        v[11] = if is_known { 0.0 } else { 1.0 };
+
+        // 12: mcc_risk
+        v[12] = comp_mcc(data.merchant_mcc);
+
+        // 13: merchant_avg_amount
+        v[13] = clamp(data.merchant_avg_amount, 10000.0);
+
+        // 14 & 15: padding zeros (already 0.0 from init)
+        v
+    }
+}
+
 #[inline(always)]
 fn comp_mcc(mcc: &[u8]) -> f32 {
     match mcc {
@@ -68,73 +137,7 @@ fn ts_weekday(b: &[u8]) -> f32 {
     ((dow + 6) % 7) as f32 / 6.0
 }
 
-pub struct DataNormalizer;
 
-impl DataNormalizer {
-    pub fn normalize(&self, data: &Payload<'_>) -> Vec<f32> {
-        let mut v = Vec::with_capacity(14);
-
-        // 0: amount
-        v.push(clamp(data.amount, 10000.0));
-
-        // 1: installments
-        v.push(clamp(data.installments as f32, 12.0));
-
-        // 2: amount_vs_avg
-        let ratio = if data.customer_avg_amount > 0.0 {
-            data.amount / data.customer_avg_amount
-        } else {
-            0.0
-        };
-        v.push(clamp(ratio, 10.0));
-
-        // 3: hour_of_day
-        v.push(ts_hour(data.requested_at));
-
-        // 4: day_of_week
-        v.push(ts_weekday(data.requested_at));
-
-        // 5 & 6: last transaction timing and distance
-        match (data.last_timestamp, data.last_km) {
-            (Some(ts), Some(km)) => {
-                let minutes = ts_to_minutes(data.requested_at) - ts_to_minutes(ts);
-                v.push(clamp(minutes as f32, 1440.0));
-                v.push(clamp(km, 1000.0));
-            }
-            _ => {
-                v.push(-1.0);
-                v.push(-1.0);
-            }
-        }
-
-        // 7: km_from_home
-        v.push(clamp(data.km_from_home, 1000.0));
-
-        // 8: tx_count_24h
-        v.push(clamp(data.tx_count_24h as f32, 20.0));
-
-        // 9: is_online
-        v.push(if data.is_online { 1.0 } else { 0.0 });
-
-        // 10: card_present
-        v.push(if data.card_present { 1.0 } else { 0.0 });
-
-        // 11: unknown_merchant
-        let id = data.merchant_id;
-        let is_known = data.known_merchants
-            .windows(id.len() + 2)
-            .any(|w| w[0] == b'"' && &w[1..w.len() - 1] == id && w[w.len() - 1] == b'"');
-        v.push(if is_known { 0.0 } else { 1.0 });
-
-        // 12: mcc_risk
-        v.push(comp_mcc(data.merchant_mcc));
-
-        // 13: merchant_avg_amount
-        v.push(clamp(data.merchant_avg_amount, 10000.0));
-
-        v
-    }
-}
 
 #[cfg(test)]
 mod tests {
