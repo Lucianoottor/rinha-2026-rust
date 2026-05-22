@@ -435,6 +435,18 @@ unsafe impl Sync for StaticHNSW {}
 // ─────────────────────────────────────────────────────────────────────────
 
 impl StaticHNSW {
+    /// Touch every page of the hot arrays sequentially to pre-fault them into the OS
+    /// page cache. One byte per 4KB page is enough; sequential access triggers OS
+    /// read-ahead so the actual I/O is pipelined. Call before accepting traffic.
+    pub fn prefetch(&self) {
+        let vb = unsafe { std::slice::from_raw_parts(self.vectors.as_ptr() as *const u8, self.n * 16) };
+        let lb = unsafe { std::slice::from_raw_parts(self.links0.as_ptr() as *const u8, self.links0_n * 4) };
+        let mut acc = 0u8;
+        for chunk in vb.chunks(4096) { acc = acc.wrapping_add(chunk[0]); }
+        for chunk in lb.chunks(4096) { acc = acc.wrapping_add(chunk[0]); }
+        std::hint::black_box(acc);
+    }
+
     pub fn build(m: usize, ef_construction: usize, ef_search: usize, k: usize, data: Vec<RawData>) -> Self {
         let n = data.len();
         let mut g = BuildGraph::new(m, ef_construction);
