@@ -1,6 +1,0 @@
-{
-  "widgetSpec": {
-    "height": "600px",
-    "prompt": "**Objective:** Design a high-performance static HNSW search implementation in Rust that beats an AVX2-optimized KD-tree for fraud detection.\n\n**Data Properties:** \n- 3,000,000 static vectors, 14 dimensions, elements normalized from 0 to 1.\n- Null flags represented by -1 in two specific dimensions.\n- Objective is finding top-5 nearest neighbors to evaluate fraud labels.\n\n**Strategy:** Form Layout outlining the code structure architecture.\n\n**Inputs Needed for Generation:**\n1. Global Query Counter Visited Set mechanism to avoid hash allocations.\n2. SIMD Vectorized Distance computation using 16-element padding for perfect 256-bit register alignment.\n3. Layer-dropping traversal loop that applies Early Global Termination checks instantly when a candidate matches the distance threshold.\n\n**Behavior:** Provide the logical layout, optimization flags, and unsafe memory block designs for the query loop."
-  }
-}
