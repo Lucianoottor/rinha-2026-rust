@@ -15,6 +15,12 @@ use crate::normalizer::DataNormalizer;
 /// - Prime CPU branch predictor and instruction cache for the HNSW hot path
 fn warmup(model: &hnsw_static::StaticHNSW, iterations: usize) {
     let t = std::time::Instant::now();
+
+    // Phase 1: fault in every mmap page sequentially so real queries never block on I/O
+    model.prefetch();
+    println!("Prefetch done in {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
+
+    // Phase 2: HNSW queries to size up QBUFS and warm CPU caches
     let mut rng = 0x517cc1b727220a95u64;
     for _ in 0..iterations {
         let mut v = [0.0f32; 16];
@@ -26,7 +32,7 @@ fn warmup(model: &hnsw_static::StaticHNSW, iterations: usize) {
         }
         let _ = model.predict(v);
     }
-    println!("Warmup: {} queries in {:.1}ms", iterations, t.elapsed().as_secs_f64() * 1000.0);
+    println!("Warmup done in {:.0}ms total", t.elapsed().as_secs_f64() * 1000.0);
 }
 
 #[monoio::main]
