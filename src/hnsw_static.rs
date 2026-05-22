@@ -1,38 +1,16 @@
-//! High-performance *static* HNSW for 14-dimensional normalised vectors.
+//! Static HNSW for 14-dim normalised vectors.
 //!
-//! Design pillars (from plan.json):
-//!
-//!   1. **Global-query-counter visited set** — flat `Vec<u32>` + generation
-//!      counter.  Marking a node visited = one array write.  Resetting the
-//!      whole table between queries = one integer increment.  No HashSet,
-//!      no heap allocation on the query hot-path.
-//!
-//!   2. **16-float padded vectors** — 14 real dimensions + 2 zero-padded
-//!      slots fill exactly two 256-bit YMM registers.  When compiled with
-//!      AVX2 + FMA (enabled via `.cargo/config.toml`) the distance kernel
-//!      resolves to: 2× VSUB + VFMADD + horizontal-reduce — ~6 instructions.
-//!
-//!   3. **Flat fixed-stride level-0 link array** — all level-0 neighbours
-//!      live in one contiguous `Box<[u32]>` with stride `m_max0`.  Accessing
-//!      node `c`'s neighbours = one pointer offset, no pointer chasing.
-//!      Slots are filled left-to-right; the first `NONE` sentinel ends the
-//!      list so the inner loop needs no length field.
-//!
-//!   4. **Early global termination** — the beam loop exits the instant the
-//!      nearest remaining candidate is farther than the current worst kept
-//!      result *and* the result set is already full.  Checked at the very
-//!      top of the loop, before any memory access.
-//!
-//!   5. **Unsafe unchecked indexing** — vectors, link rows, and the visited
-//!      table are all accessed via `get_unchecked` in the inner loop.
-//!      Invariants are established at build time and documented inline.
+//! Build stores f32[16] for accuracy; freeze quantises to u8[16] (4× smaller).
+//! Saved index is a flat binary file; loaded via memmap2 so two Docker
+//! instances share the same physical pages (MAP_SHARED, OS page cache).
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::ptr::NonNull;
 use crate::types::RawData;
 
-// ── Ordered-float newtype for BinaryHeap ─────────────────────────────────
+// ── Ordered-float newtype ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);
@@ -46,15 +24,11 @@ impl Ord for OrdF32 {
     }
 }
 
-// ── 1. Global-query-counter visited set ──────────────────────────────────
-//
-// `marks[id] == gen`  →  node already visited this query.
-// New query: `gen += 1`  (O(1), no memset).
-// Every 2^32 queries the array is bulk-zeroed and gen wraps to 1.
+// ── Generation-counter visited set (O(1) reset) ───────────────────────────
 
 struct VisitedTable {
     marks:      Vec<u32>,
-    generation: u32,   // `gen` is reserved in edition 2024
+    generation: u32,
 }
 
 impl VisitedTable {
@@ -70,11 +44,8 @@ impl VisitedTable {
         if self.generation == 0 { self.marks.fill(0); self.generation = 1; }
     }
 
-    /// Returns `true` if this is the first visit this query; marks the node.
-    /// Safety: caller must guarantee `id < marks.len()`.
     #[inline(always)]
     unsafe fn visit_unchecked(&mut self, id: u32) -> bool {
-        // Rust 2024: unsafe body of unsafe fn still requires explicit unsafe block.
         unsafe {
             let slot = self.marks.get_unchecked_mut(id as usize);
             if *slot == self.generation { return false; }
@@ -84,11 +55,10 @@ impl VisitedTable {
     }
 }
 
-// All per-query scratch lives here.  Thread-local → zero allocation per query.
 struct QueryBufs {
     visited: VisitedTable,
-    cands:   BinaryHeap<Reverse<(OrdF32, u32)>>,   // min-heap: closest candidate first
-    results: BinaryHeap<(OrdF32, u32)>,             // max-heap: farthest kept result first
+    cands:   BinaryHeap<Reverse<(OrdF32, u32)>>,
+    results: BinaryHeap<(OrdF32, u32)>,
 }
 
 impl QueryBufs {
@@ -101,15 +71,9 @@ thread_local! {
     static QBUFS: RefCell<QueryBufs> = RefCell::new(QueryBufs::new());
 }
 
-// ── 2. Distance kernel — two 256-bit YMM registers ───────────────────────
-//
-// Vectors are padded to 16 floats.  Elements 14 & 15 are always 0.0 so
-// they contribute zero to the squared distance.
-//
-// With `target-feature=+avx2,+fma` (set in .cargo/config.toml) this
-// compiles to the AVX2 path at zero runtime cost.
+// ── Distance kernels ──────────────────────────────────────────────────────
 
-// AVX2 + FMA fast path — compiled only when those features are available.
+// f32 path — build phase only
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     target_feature = "avx2",
@@ -117,23 +81,17 @@ thread_local! {
 ))]
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn sq_dist_avx2(a: *const f32, b: *const f32) -> f32 {
-    // Rust 2024: unsafe operations inside an `unsafe fn` still require an
-    // explicit `unsafe {}` block.
+unsafe fn sq_dist_avx2_f32(a: *const f32, b: *const f32) -> f32 {
     unsafe {
         use std::arch::x86_64::*;
-        // Load two 256-bit blocks (16 floats total)
         let a0  = _mm256_loadu_ps(a);
         let b0  = _mm256_loadu_ps(b);
         let a1  = _mm256_loadu_ps(a.add(8));
         let b1  = _mm256_loadu_ps(b.add(8));
-        // d0 = a0 − b0;  acc = d0²
         let d0  = _mm256_sub_ps(a0, b0);
         let acc = _mm256_mul_ps(d0, d0);
-        // d1 = a1 − b1;  acc = d1² + acc  (FMA)
         let d1  = _mm256_sub_ps(a1, b1);
         let acc = _mm256_fmadd_ps(d1, d1, acc);
-        // Horizontal sum: 8 lanes → 1 scalar
         let lo  = _mm256_castps256_ps128(acc);
         let hi  = _mm256_extractf128_ps(acc, 1);
         let s4  = _mm_add_ps(lo, hi);
@@ -150,29 +108,60 @@ fn sq_dist_16(a: &[f32; 16], b: &[f32; 16]) -> f32 {
         target_feature = "avx2",
         target_feature = "fma"
     ))]
-    // Safety: pointers point to valid 16-float arrays; AVX2+FMA are guaranteed
-    // by the compile-time cfg flags above.
-    return unsafe { sq_dist_avx2(a.as_ptr(), b.as_ptr()) };
-
-    // Scalar fallback — fully unrolled; LLVM will auto-vectorise this too.
+    return unsafe { sq_dist_avx2_f32(a.as_ptr(), b.as_ptr()) };
     #[allow(unreachable_code)]
     {
-        let d0  = a[0]  - b[0];  let d1  = a[1]  - b[1];
-        let d2  = a[2]  - b[2];  let d3  = a[3]  - b[3];
-        let d4  = a[4]  - b[4];  let d5  = a[5]  - b[5];
-        let d6  = a[6]  - b[6];  let d7  = a[7]  - b[7];
-        let d8  = a[8]  - b[8];  let d9  = a[9]  - b[9];
-        let d10 = a[10] - b[10]; let d11 = a[11] - b[11];
-        let d12 = a[12] - b[12]; let d13 = a[13] - b[13];
-        d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
-        d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
+        let mut s = 0f32;
+        for i in 0..14 { let d = a[i] - b[i]; s += d * d; }
+        s
     }
 }
 
-// Sentinel value for unused slots in the flat link array.
+// u8 path — query phase
+// _mm256_cvtepu8_epi16: 16×u8 → 16×i16 (one 128-bit load → 256-bit)
+// _mm256_madd_epi16(d,d): adjacent pairs of i16 squares summed → 8×i32
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn sq_dist_u8_avx2(a: *const u8, b: *const u8) -> u32 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let a16  = _mm256_cvtepu8_epi16(_mm_loadu_si128(a as *const __m128i));
+        let b16  = _mm256_cvtepu8_epi16(_mm_loadu_si128(b as *const __m128i));
+        let diff = _mm256_sub_epi16(a16, b16);
+        let sq   = _mm256_madd_epi16(diff, diff);  // 8×i32
+        let lo   = _mm256_castsi256_si128(sq);
+        let hi   = _mm256_extracti128_si256(sq, 1);
+        let s4   = _mm_add_epi32(lo, hi);
+        let s2   = _mm_hadd_epi32(s4, s4);
+        let s1   = _mm_hadd_epi32(s2, s2);
+        _mm_cvtsi128_si32(s1) as u32
+    }
+}
+
+#[inline(always)]
+fn sq_dist_u8(a: &[u8; 16], b: &[u8; 16]) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    return unsafe { sq_dist_u8_avx2(a.as_ptr(), b.as_ptr()) };
+    #[allow(unreachable_code)]
+    {
+        let mut s = 0u32;
+        for i in 0..14 { let d = a[i] as i32 - b[i] as i32; s += (d * d) as u32; }
+        s
+    }
+}
+
+/// Map [0,1] f32 → u8.  Values outside range are clamped.
+#[inline(always)]
+fn quantize(v: &[f32; 16]) -> [u8; 16] {
+    let mut q = [0u8; 16];
+    for i in 0..16 { q[i] = (v[i] * 255.0).clamp(0.0, 255.0) as u8; }
+    q
+}
+
 const NONE: u32 = u32::MAX;
 
-// ── Build-phase mutable graph ─────────────────────────────────────────────
+// ── Build-phase structures (f32, dropped after freeze) ────────────────────
 
 struct BuildBufs {
     visited: std::collections::HashSet<u32>,
@@ -184,9 +173,8 @@ struct BuildBufs {
 
 impl BuildBufs {
     fn new(ef: usize, m: usize) -> Self {
-        let cap = ef * m;
         Self {
-            visited: std::collections::HashSet::with_capacity(cap),
+            visited: std::collections::HashSet::with_capacity(ef * m),
             cands:   BinaryHeap::with_capacity(ef * 2),
             results: BinaryHeap::with_capacity(ef + 1),
             out:     Vec::with_capacity(ef),
@@ -198,7 +186,7 @@ impl BuildBufs {
 struct BuildGraph {
     vectors:     Vec<[f32; 16]>,
     labels:      Vec<bool>,
-    connections: Vec<Vec<Vec<u32>>>,  // [node][level] = neighbour ids
+    connections: Vec<Vec<Vec<u32>>>,
     entry:       u32,
     max_level:   usize,
     m:           usize,
@@ -267,7 +255,7 @@ impl BuildGraph {
             if level >= conns.len() { continue; }
             for &nb in &conns[level] {
                 if !b.visited.insert(nb) { continue; }
-                let ed = self.dist(q, nb);
+                let ed    = self.dist(q, nb);
                 let worst = b.results.peek().map(|&(OrdF32(d), _)| d).unwrap_or(f32::INFINITY);
                 if b.results.len() < ef || ed < worst {
                     b.cands.push(Reverse((OrdF32(ed), nb)));
@@ -304,7 +292,7 @@ impl BuildGraph {
 
         for lc in (0..=l.min(level)).rev() {
             self.beam_search(&vector, &ep, self.ef_con, lc, b);
-            let m_at = if lc == 0 { self.m_max0 } else { self.m_max };
+            let m_at  = if lc == 0 { self.m_max0 } else { self.m_max };
             let m_sel = self.m.min(m_at);
 
             new_conns[lc].clear();
@@ -318,7 +306,7 @@ impl BuildGraph {
                 self.connections[nb as usize][lc].push(new_id);
 
                 if self.connections[nb as usize][lc].len() > m_at {
-                    let nb_vec: [f32; 16] = self.vectors[nb as usize];
+                    let nb_vec = self.vectors[nb as usize];
                     b.shrink.clear();
                     b.shrink.extend(
                         self.connections[nb as usize][lc]
@@ -339,40 +327,51 @@ impl BuildGraph {
         self.connections.push(new_conns);
     }
 
-    // Consume the mutable graph, freeze into compact static representation.
     fn freeze(self, ef_search: usize, k: usize) -> StaticHNSW {
-        let n    = self.vectors.len();
-        let m0   = self.m_max0;
+        let n  = self.vectors.len();
+        let m0 = self.m_max0;
 
-        // 3. Flat fixed-stride level-0 link array.
-        // Slot layout per node: [nb0, nb1, ..., nbK, NONE, NONE, ..., NONE]
-        // Slots are filled left-to-right so `NONE` terminates the scan.
-        let mut links0 = vec![NONE; n * m0];
+        // Quantise f32 → u8 (4× smaller; distance ordering preserved)
+        let q_vecs: Vec<[u8; 16]> = self.vectors.iter().map(quantize).collect();
+        let labels:  Vec<u8>      = self.labels.iter().map(|&b| b as u8).collect();
+
+        // Flat fixed-stride level-0 link array
+        let mut links0_vec = vec![NONE; n * m0];
         for (id, conns) in self.connections.iter().enumerate() {
             if conns.is_empty() { continue; }
             let base = id * m0;
-            for (i, &nb) in conns[0].iter().enumerate() {
-                links0[base + i] = nb;
-            }
+            for (i, &nb) in conns[0].iter().enumerate() { links0_vec[base + i] = nb; }
         }
 
-        // Upper-level connections (level ≥ 1); stored only for nodes that need them.
+        // Upper-level connections (only nodes at level ≥ 1 — small fraction)
         let mut upper: HashMap<u32, Box<[Box<[u32]>]>> = HashMap::new();
         for (id, conns) in self.connections.iter().enumerate() {
             if conns.len() > 1 {
-                let uc: Box<[Box<[u32]>]> = conns[1..]
-                    .iter()
+                let uc: Box<[Box<[u32]>]> = conns[1..].iter()
                     .map(|v| v.clone().into_boxed_slice())
                     .collect();
                 upper.insert(id as u32, uc);
             }
         }
 
+        let mut vecs_box:  Box<[[u8; 16]]> = q_vecs.into_boxed_slice();
+        let mut lbls_box:  Box<[u8]>       = labels.into_boxed_slice();
+        let mut links_box: Box<[u32]>       = links0_vec.into_boxed_slice();
+
+        // Derive raw ptrs before moving boxes into the enum.
+        // Box heap data is stable — address doesn't change on Box move.
+        let vptr  = NonNull::new(vecs_box.as_mut_ptr()).unwrap();
+        let lptr  = NonNull::new(lbls_box.as_mut_ptr()).unwrap();
+        let l0ptr = NonNull::new(links_box.as_mut_ptr()).unwrap();
+
         StaticHNSW {
-            vectors:   self.vectors.into_boxed_slice(),
-            labels:    self.labels.into_boxed_slice(),
-            links0:    links0.into_boxed_slice(),
-            m_max0:    m0 as u32,
+            backing:   Backing::Owned { vectors: vecs_box, labels: lbls_box, links0: links_box },
+            vectors:   vptr,
+            labels:    lptr,
+            links0:    l0ptr,
+            n,
+            links0_n:  n * m0,
+            m_max0:    m0,
             upper,
             entry:     self.entry,
             max_level: self.max_level,
@@ -384,16 +383,29 @@ impl BuildGraph {
 
 // ── Public static index ───────────────────────────────────────────────────
 
+/// Which allocation backs the hot arrays.
+/// Fields are drop guards only — never read, but must live as long as the raw ptrs.
+#[allow(dead_code)]
+enum Backing {
+    Owned {
+        vectors: Box<[[u8; 16]]>,
+        labels:  Box<[u8]>,
+        links0:  Box<[u32]>,
+    },
+    /// The Mmap keeps the file mapping alive; raw ptrs point into it.
+    Mapped(memmap2::Mmap),
+}
+
+#[allow(dead_code)]
 pub struct StaticHNSW {
-    /// 14-dim vectors padded to 16 floats (elements 14 & 15 = 0.0).
-    vectors:   Box<[[f32; 16]]>,
-    labels:    Box<[bool]>,
-    /// Flat level-0 links: `links0[node * m_max0 .. (node+1) * m_max0]`.
-    /// Unused trailing slots contain `NONE`; the first `NONE` ends the list.
-    links0:    Box<[u32]>,
-    m_max0:    u32,
-    /// Upper-level connections for nodes at level ≥ 1.
-    /// `upper[id][lc-1]` = neighbour ids at level `lc`.
+    backing:   Backing,
+    /// Points into either the owned Box or the mmap.
+    vectors:   NonNull<[u8; 16]>,
+    labels:    NonNull<u8>,
+    links0:    NonNull<u32>,
+    n:         usize,
+    links0_n:  usize,
+    m_max0:    usize,
     upper:     HashMap<u32, Box<[Box<[u32]>]>>,
     entry:     u32,
     max_level: usize,
@@ -401,9 +413,28 @@ pub struct StaticHNSW {
     k:         usize,
 }
 
+// Safety: raw ptrs are either into Box-owned heap (exclusive) or a
+// read-only mmap (safe to share as immutable data across threads).
+unsafe impl Send for StaticHNSW {}
+unsafe impl Sync for StaticHNSW {}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Binary file layout (little-endian, 48-byte header):
+//   [0..4]   b"HNSW"
+//   [4]      version=2
+//   [5..8]   pad
+//   [8..16]  n: u64
+//   [16..20] m_max0: u32
+//   [20..24] max_level: u32
+//   [24..28] entry: u32
+//   [28..32] ef_search: u32
+//   [32..36] k: u32
+//   [36..40] upper_cnt: u32
+//   [40..48] pad
+//   [48..]   vectors [[u8;16];n], labels [u8;n], (4-aligned) links0 [u32;n*m_max0], upper blob
+// ─────────────────────────────────────────────────────────────────────────
+
 impl StaticHNSW {
-    /// Build the static index from raw training data.
-    /// Uses one reused `BuildBufs` allocation for the entire construction.
     pub fn build(m: usize, ef_construction: usize, ef_search: usize, k: usize, data: Vec<RawData>) -> Self {
         let n = data.len();
         let mut g = BuildGraph::new(m, ef_construction);
@@ -413,9 +444,8 @@ impl StaticHNSW {
 
         let mut b = BuildBufs::new(ef_construction, m);
         for raw in data {
-            debug_assert_eq!(raw.vector.len(), 14, "vector must have 14 elements");
+            debug_assert_eq!(raw.vector.len(), 14);
             let mut v = [0.0f32; 16];
-            // Safety: raw.vector has 14 elements (checked above); copy is in-bounds.
             unsafe { std::ptr::copy_nonoverlapping(raw.vector.as_ptr(), v.as_mut_ptr(), 14); }
             g.insert(v, raw.label == "fraud", &mut b);
         }
@@ -423,15 +453,116 @@ impl StaticHNSW {
         g.freeze(ef_search, k)
     }
 
-    #[inline(always)]
-    fn dist_qn(&self, q: &[f32; 16], n: u32) -> f32 {
-        // Safety: n is always a valid node index (returned by the graph itself).
-        sq_dist_16(q, unsafe { self.vectors.get_unchecked(n as usize) })
+    /// Serialize the index to a flat binary file.
+    pub fn save(&self, path: &str) {
+        use std::io::{BufWriter, Write};
+
+        let f = std::fs::File::create(path).expect("create index file");
+        let mut w = BufWriter::new(f);
+
+        w.write_all(b"HNSW").unwrap();
+        w.write_all(&[2u8, 0, 0, 0]).unwrap();
+        w.write_all(&(self.n as u64).to_le_bytes()).unwrap();
+        w.write_all(&(self.m_max0 as u32).to_le_bytes()).unwrap();
+        w.write_all(&(self.max_level as u32).to_le_bytes()).unwrap();
+        w.write_all(&self.entry.to_le_bytes()).unwrap();
+        w.write_all(&(self.ef_search as u32).to_le_bytes()).unwrap();
+        w.write_all(&(self.k as u32).to_le_bytes()).unwrap();
+        w.write_all(&(self.upper.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(&[0u8; 8]).unwrap();  // pad to 48 bytes (4+4+8+4+4+4+4+4+4+8=48)
+
+        let vb = unsafe { std::slice::from_raw_parts(self.vectors.as_ptr() as *const u8, self.n * 16) };
+        w.write_all(vb).unwrap();
+
+        let lb = unsafe { std::slice::from_raw_parts(self.labels.as_ptr(), self.n) };
+        w.write_all(lb).unwrap();
+
+        let pos = 48 + self.n * 17;
+        let pad = (4 - pos % 4) % 4;
+        w.write_all(&[0u8, 0, 0][..pad]).unwrap();
+
+        let l0b = unsafe { std::slice::from_raw_parts(self.links0.as_ptr() as *const u8, self.links0_n * 4) };
+        w.write_all(l0b).unwrap();
+
+        for (&node_id, levels) in &self.upper {
+            w.write_all(&node_id.to_le_bytes()).unwrap();
+            w.write_all(&(levels.len() as u32).to_le_bytes()).unwrap();
+            for level in levels.iter() {
+                w.write_all(&(level.len() as u32).to_le_bytes()).unwrap();
+                for &nb in level.iter() { w.write_all(&nb.to_le_bytes()).unwrap(); }
+            }
+        }
     }
 
-    // Greedy ef=1 descent used for layers above level 0.
-    fn greedy_single(&self, q: &[f32; 16], mut cur: u32, level: usize) -> u32 {
-        let lc = level - 1;  // index into upper[cur]: upper[id][0] = level 1
+    /// Load from a flat binary file via mmap.
+    /// Both API containers map the same named-volume file; the OS shares pages.
+    pub fn load(path: &str) -> Self {
+        use memmap2::MmapOptions;
+
+        let file = std::fs::File::open(path).expect("open index file");
+        let mmap = unsafe { MmapOptions::new().map(&file).expect("mmap index file") };
+
+        assert_eq!(&mmap[0..4], b"HNSW", "bad magic");
+        assert_eq!(mmap[4], 2, "unsupported version");
+
+        let n         = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+        let m_max0    = u32::from_le_bytes(mmap[16..20].try_into().unwrap()) as usize;
+        let max_level = u32::from_le_bytes(mmap[20..24].try_into().unwrap()) as usize;
+        let entry     = u32::from_le_bytes(mmap[24..28].try_into().unwrap());
+        let ef_search = u32::from_le_bytes(mmap[28..32].try_into().unwrap()) as usize;
+        let k         = u32::from_le_bytes(mmap[32..36].try_into().unwrap()) as usize;
+        let upper_cnt = u32::from_le_bytes(mmap[36..40].try_into().unwrap()) as usize;
+
+        let vecs_off  = 48usize;
+        let lbls_off  = vecs_off + n * 16;
+        let l0_off    = (lbls_off + n + 3) & !3;  // 4-byte aligned
+        let upper_off = l0_off + n * m_max0 * 4;
+        let links0_n  = n * m_max0;
+
+        // Ptrs into mmap; valid for `mmap`'s lifetime (stored in Backing::Mapped below).
+        let vectors = NonNull::new(mmap[vecs_off..].as_ptr() as *mut [u8; 16]).unwrap();
+        let labels  = NonNull::new(mmap[lbls_off..].as_ptr() as *mut u8).unwrap();
+        let links0  = NonNull::new(mmap[l0_off..].as_ptr() as *mut u32).unwrap();
+
+        let mut upper: HashMap<u32, Box<[Box<[u32]>]>> = HashMap::new();
+        let mut cur = upper_off;
+        for _ in 0..upper_cnt {
+            let node_id = u32::from_le_bytes(mmap[cur..cur+4].try_into().unwrap()); cur += 4;
+            let nl      = u32::from_le_bytes(mmap[cur..cur+4].try_into().unwrap()) as usize; cur += 4;
+            let mut lvls: Vec<Box<[u32]>> = Vec::with_capacity(nl);
+            for _ in 0..nl {
+                let cnt = u32::from_le_bytes(mmap[cur..cur+4].try_into().unwrap()) as usize; cur += 4;
+                let mut nbs: Vec<u32> = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
+                    nbs.push(u32::from_le_bytes(mmap[cur..cur+4].try_into().unwrap()));
+                    cur += 4;
+                }
+                lvls.push(nbs.into_boxed_slice());
+            }
+            upper.insert(node_id, lvls.into_boxed_slice());
+        }
+
+        StaticHNSW {
+            backing: Backing::Mapped(mmap),
+            vectors, labels, links0,
+            n, links0_n, m_max0,
+            upper, entry, max_level, ef_search, k,
+        }
+    }
+
+    #[inline(always)]
+    fn dist_qn(&self, q: &[u8; 16], node: u32) -> f32 {
+        // Safety: node < n by construction throughout build and search.
+        sq_dist_u8(q, unsafe { &*self.vectors.as_ptr().add(node as usize) }) as f32
+    }
+
+    #[inline(always)]
+    fn links0_row(&self, node: usize) -> &[u32] {
+        unsafe { std::slice::from_raw_parts(self.links0.as_ptr().add(node * self.m_max0), self.m_max0) }
+    }
+
+    fn greedy_single(&self, q: &[u8; 16], mut cur: u32, level: usize) -> u32 {
+        let lc = level - 1;
         let mut cur_d = self.dist_qn(q, cur);
         loop {
             let mut improved = false;
@@ -448,42 +579,25 @@ impl StaticHNSW {
         cur
     }
 
-    // Full beam search at level 0 writing results into the thread-local QueryBufs.
-    fn beam_search_l0(&self, q: &[f32; 16], ep: u32, ef: usize, qb: &mut QueryBufs) {
-        let n     = self.vectors.len();
-        let m_max0 = self.m_max0 as usize;
-
-        qb.visited.ensure_capacity(n);
+    fn beam_search_l0(&self, q: &[u8; 16], ep: u32, ef: usize, qb: &mut QueryBufs) {
+        qb.visited.ensure_capacity(self.n);
         qb.visited.reset();
         qb.cands.clear();
         qb.results.clear();
 
-        // Safety: ep < n by construction.
         unsafe { qb.visited.visit_unchecked(ep); }
         let d0 = self.dist_qn(q, ep);
         qb.cands.push(Reverse((OrdF32(d0), ep)));
         qb.results.push((OrdF32(d0), ep));
 
         while let Some(Reverse((OrdF32(cd), c))) = qb.cands.pop() {
-            // ── 3. Early global termination ──────────────────────────────
-            // Nearest remaining candidate already farther than our worst kept
-            // result → no future candidate can improve the result set.
             if let Some(&(OrdF32(fd), _)) = qb.results.peek() {
                 if cd > fd && qb.results.len() >= ef { break; }
             }
-
-            // ── 5. Unsafe flat-stride link access ────────────────────────
-            // Safety: c < n, so base + m_max0 <= links0.len() by construction.
-            let base = c as usize * m_max0;
-            let row  = unsafe { self.links0.get_unchecked(base..base + m_max0) };
-
-            for &nb in row {
-                if nb == NONE { break; }  // slots filled left-to-right; first NONE ends list
-
-                // Safety: nb < n (enforced during build); n <= visited.len() (ensure_capacity).
+            for &nb in self.links0_row(c as usize) {
+                if nb == NONE { break; }
                 if !unsafe { qb.visited.visit_unchecked(nb) } { continue; }
-
-                let ed = self.dist_qn(q, nb);
+                let ed    = self.dist_qn(q, nb);
                 let worst = qb.results.peek().map(|&(OrdF32(d), _)| d).unwrap_or(f32::INFINITY);
                 if qb.results.len() < ef || ed < worst {
                     qb.cands.push(Reverse((OrdF32(ed), nb)));
@@ -494,32 +608,30 @@ impl StaticHNSW {
         }
     }
 
-    /// Returns fraud fraction among the k nearest neighbours.
-    /// Example: [legit, legit, fraud, fraud, fraud] → 3 / 5 = 0.6
     pub fn predict(&self, q: [f32; 16]) -> f32 {
-        if self.vectors.is_empty() { return 0.0; }
+        if self.n == 0 { return 0.0; }
 
-        // Phase 1: ef=1 greedy descent through upper layers.
+        let q8 = quantize(&q);
+
         let mut ep = self.entry;
         for lc in (1..=self.max_level).rev() {
-            ep = self.greedy_single(&q, ep, lc);
+            ep = self.greedy_single(&q8, ep, lc);
         }
 
-        // Phase 2: beam search at level 0; count fraud inline, no Vec allocation.
         let ef = self.ef_search.max(self.k);
         QBUFS.with(|cell| {
             let mut qb = cell.borrow_mut();
-            self.beam_search_l0(&q, ep, ef, &mut qb);
+            self.beam_search_l0(&q8, ep, ef, &mut qb);
 
-            let s = qb.results.len();
-            for _ in 0..s.saturating_sub(self.k) { qb.results.pop(); }
+            let extra = qb.results.len().saturating_sub(self.k);
+            for _ in 0..extra { qb.results.pop(); }
 
             let total = qb.results.len();
             if total == 0 { return 0.0; }
 
-            // Safety: ids are valid indices returned by beam_search_l0.
+            // Safety: ids returned by beam_search_l0 are always valid node indices.
             let fraud = qb.results.drain()
-                .filter(|&(_, id)| unsafe { *self.labels.get_unchecked(id as usize) })
+                .filter(|&(_, id)| unsafe { *self.labels.as_ptr().add(id as usize) != 0 })
                 .count();
 
             fraud as f32 / total as f32

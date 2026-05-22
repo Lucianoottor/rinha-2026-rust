@@ -16,7 +16,7 @@ pub struct Payload<'a> {
 }
 
 
-// IA gerou as const de comparacao - fara o match com o inicio da word para aplicar jump e evitar leitura de chars
+// IA gerou as const de comparacao - fara o match com o inicio da word para aplicar jump
 const K_ID: u64          = u64::from_le_bytes([b'i', b'd',  0,   0,   0,   0,   0,   0  ]);
 const K_TRANSACTION: u64 = u64::from_le_bytes([b't', b'r', b'a', b'n', b's', b'a', b'c', b't']);
 const K_CUSTOMER: u64    = u64::from_le_bytes([b'c', b'u', b's', b't', b'o', b'm', b'e', b'r']);

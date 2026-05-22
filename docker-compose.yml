@@ -1,25 +1,50 @@
 services:
+  indexer:
+    platform: linux/amd64
+    build: .
+    command: ["./build"]
+    environment:
+      - DATA_PATH=/app/resources/references.json.gz
+      - INDEX_PATH=/data/index.bin
+    volumes:
+      - index-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.9"
+          memory: "2048M"
+
   api-1:
     platform: linux/amd64
     build: .
     environment:
-      - DATA_PATH=/app/resources/references.json.gz
+      - INDEX_PATH=/data/index.bin
+    volumes:
+      - index-data:/data:ro
+    depends_on:
+      indexer:
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
-          cpus: "0.475"
-          memory: "1165M"
+          cpus: "0.45"
+          memory: "165M"
 
   api-2:
     platform: linux/amd64
     build: .
     environment:
-      - DATA_PATH=/app/resources/references.json.gz
+      - INDEX_PATH=/data/index.bin
+    volumes:
+      - index-data:/data:ro
+    depends_on:
+      indexer:
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
-          cpus: "0.475"
-          memory: "1165M"
+          cpus: "0.45"
+          memory: "165M"
 
   nginx:
     platform: linux/amd64
@@ -34,5 +59,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.05"
+          cpus: "0.1"
           memory: "20M"
+
+volumes:
+  index-data:

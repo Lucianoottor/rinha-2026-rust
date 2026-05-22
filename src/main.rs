@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-mod parse;
 mod normalizer;
 mod hnsw_static;
 mod types;
@@ -9,19 +7,36 @@ use std::sync::Arc;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpListener;
 
-use crate::parse::DataLoader;
-use crate::{
-    normalizer::DataNormalizer,
-};
+use crate::normalizer::DataNormalizer;
+
+/// Run synthetic queries before accepting traffic to:
+/// - Pre-allocate the 12 MB VisitedTable (ensure_capacity on first predict call)
+/// - Fault in the hot mmap pages (upper layers + high-degree nodes) into OS page cache
+/// - Prime CPU branch predictor and instruction cache for the HNSW hot path
+fn warmup(model: &hnsw_static::StaticHNSW, iterations: usize) {
+    let t = std::time::Instant::now();
+    let mut rng = 0x517cc1b727220a95u64;
+    for _ in 0..iterations {
+        let mut v = [0.0f32; 16];
+        for x in v[..14].iter_mut() {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            *x = (rng >> 11) as f32 / (1u64 << 53) as f32;
+        }
+        let _ = model.predict(v);
+    }
+    println!("Warmup: {} queries in {:.1}ms", iterations, t.elapsed().as_secs_f64() * 1000.0);
+}
 
 #[monoio::main]
 async fn main() {
-    let train_data_path = std::env::var("DATA_PATH")
-        .unwrap_or_else(|_| "src/resources/references.json.gz".to_string());
-    let train_data = DataLoader::load_train_data(train_data_path.as_str());
-    let knn_model = Arc::new(
-        hnsw_static::StaticHNSW::build(16, 40, 20, 5, train_data)
-    );
+    let index_path = std::env::var("INDEX_PATH")
+        .unwrap_or_else(|_| "resources/index.bin".to_string());
+    let knn_model = Arc::new(hnsw_static::StaticHNSW::load(&index_path));
+
+    warmup(&knn_model, 500);
+
     let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind to port 8080");
     println!("Server running on http://0.0.0.0:8080");
 
@@ -56,7 +71,6 @@ async fn main() {
                                 let q = DataNormalizer.normalize(&data);
                                 let fraud_score = knn_model.predict(q);
                                 let approved = fraud_score < 0.6;
-                                // body length is fixed: true=35 chars, false=36 chars, fraud_score always X.X (3 chars)
                                 let body_len = if approved { 35usize } else { 36 };
                                 let mut response = Vec::with_capacity(128);
                                 let _ = write!(
