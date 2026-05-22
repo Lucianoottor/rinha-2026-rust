@@ -2,10 +2,6 @@ services:
   api-1:
     platform: linux/amd64
     build: .
-    environment:
-      - INDEX_PATH=/data/index.bin
-    volumes:
-      - ./index.bin:/data/index.bin:ro
     deploy:
       resources:
         limits:
@@ -15,10 +11,6 @@ services:
   api-2:
     platform: linux/amd64
     build: .
-    environment:
-      - INDEX_PATH=/data/index.bin
-    volumes:
-      - ./index.bin:/data/index.bin:ro
     deploy:
       resources:
         limits:
