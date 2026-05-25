@@ -1,7 +1,7 @@
 services:
   api-1:
     platform: linux/amd64
-    image: ghcr.io/lucianoottor/rinha-2026-rust:latest
+    build: .
     environment:
       - SOCK_PATH=/sockets/api1.sock
     volumes:
@@ -14,7 +14,7 @@ services:
 
   api-2:
     platform: linux/amd64
-    image: ghcr.io/lucianoottor/rinha-2026-rust:latest
+    build: .
     environment:
       - SOCK_PATH=/sockets/api2.sock
     volumes:
