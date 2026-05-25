@@ -32,7 +32,8 @@ fn main() {
     let hnsw_model: &'static StaticHNSW = Box::leak(hnsw_model);
     warmup(hnsw_model, 500);
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(1024)
         .build()
         .expect("build monoio runtime");
 
