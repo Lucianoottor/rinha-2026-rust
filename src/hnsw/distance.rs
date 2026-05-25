@@ -75,6 +75,6 @@ pub fn sq_dist_u8(a: &[u8; 16], b: &[u8; 16]) -> u32 {
 #[inline(always)]
 pub fn quantize(v: &[f32; 16]) -> [u8; 16] {
     let mut q = [0u8; 16];
-    for i in 0..16 { q[i] = (v[i] * 255.0).clamp(0.0, 255.0) as u8; }
+    for i in 0..16 { q[i] = ((v[i] + 1.0) * 127.5).clamp(0.0, 255.0) as u8; }
     q
 }

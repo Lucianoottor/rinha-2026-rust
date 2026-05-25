@@ -13,7 +13,7 @@ fn main() {
     println!("Loaded {} records", n);
 
     println!("Building HNSW index (m=16, ef_construction=40)...");
-    let model = hnsw::build_index(16, 40, 20, 5, train_data);
+    let model = hnsw::build_index(16, 40, 40, 5, train_data);
 
     println!("Saving index to {}...", index_path);
     model.save(&index_path);
