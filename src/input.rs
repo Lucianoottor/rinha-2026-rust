@@ -16,48 +16,29 @@ pub struct Payload<'a> {
 }
 
 
-// IA gerou as const de comparacao - fara o match com o inicio da word para aplicar jump
 const K_ID: u64          = u64::from_le_bytes([b'i', b'd',  0,   0,   0,   0,   0,   0  ]);
 const K_TRANSACTION: u64 = u64::from_le_bytes([b't', b'r', b'a', b'n', b's', b'a', b'c', b't']);
 const K_CUSTOMER: u64    = u64::from_le_bytes([b'c', b'u', b's', b't', b'o', b'm', b'e', b'r']);
 const K_MERCHANT: u64    = u64::from_le_bytes([b'm', b'e', b'r', b'c', b'h', b'a', b'n', b't']);
 const K_TERMINAL: u64    = u64::from_le_bytes([b't', b'e', b'r', b'm', b'i', b'n', b'a', b'l']);
-// "last_transaction" → first 8 = "last_tra"
 const K_LAST_TX: u64     = u64::from_le_bytes([b'l', b'a', b's', b't', b'_', b't', b'r', b'a']);
 
-// transaction object
 const K_AMOUNT: u64      = u64::from_le_bytes([b'a', b'm', b'o', b'u', b'n', b't',  0,   0  ]);
-// "installments" → first 8 = "installm"
 const K_INSTALLM: u64    = u64::from_le_bytes([b'i', b'n', b's', b't', b'a', b'l', b'l', b'm']);
-// "requested_at" → first 8 = "requeste"
 const K_REQUESTED: u64   = u64::from_le_bytes([b'r', b'e', b'q', b'u', b'e', b's', b't', b'e']);
 
-// customer object
-// "avg_amount" → first 8 = "avg_amou"
 const K_AVG_AMOUNT: u64  = u64::from_le_bytes([b'a', b'v', b'g', b'_', b'a', b'm', b'o', b'u']);
-// "tx_count_24h" → first 8 = "tx_count"
 const K_TX_COUNT: u64    = u64::from_le_bytes([b't', b'x', b'_', b'c', b'o', b'u', b'n', b't']);
-// "known_merchants" → first 8 = "known_me"
 const K_KNOWN_MERCH: u64 = u64::from_le_bytes([b'k', b'n', b'o', b'w', b'n', b'_', b'm', b'e']);
 
-// merchant object  (K_ID and K_AVG_AMOUNT reused)
 const K_MCC: u64         = u64::from_le_bytes([b'm', b'c', b'c',  0,   0,   0,   0,   0  ]);
 
-// terminal object
-// "is_online" → first 8 = "is_onlin"
 const K_IS_ONLINE: u64   = u64::from_le_bytes([b'i', b's', b'_', b'o', b'n', b'l', b'i', b'n']);
-// "card_present" → first 8 = "card_pre"
 const K_CARD_PRES: u64   = u64::from_le_bytes([b'c', b'a', b'r', b'd', b'_', b'p', b'r', b'e']);
-// "km_from_home" / "km_from_current" → first 8 = "km_from_"
 const K_KM_FROM: u64     = u64::from_le_bytes([b'k', b'm', b'_', b'f', b'r', b'o', b'm', b'_']);
 
-// last_transaction object
-// "timestamp" → first 8 = "timestam"
 const K_TIMESTAMP: u64   = u64::from_le_bytes([b't', b'i', b'm', b'e', b's', b't', b'a', b'm']);
 
-
-// https://graphics.stanford.edu/~seander/bithacks.html#ZeroInWord
-// identifica se o char esta presente no conjunto x
 #[inline(always)]
 fn has_byte(x: u64, needle: u8) -> bool {
     let v = x ^ (0x0101_0101_0101_0101_u64.wrapping_mul(needle as u64));
@@ -252,7 +233,6 @@ impl<'a> Scanner<'a> {
             let (h, klen) = self.read_key()?;
             self.skip_ws(); self.expect(b':')?; self.skip_ws();
 
-            // compara com as const no inicio do codigo - se encontrar, pula os chars que ja sabemos quais sao e nao precisam ser lidos
             match (h, klen) {
                 (K_AMOUNT,     6)  => amount       = Some(self.parse_f32()?),
                 (K_INSTALLM,   12) => installments = Some(self.parse_u32()?),

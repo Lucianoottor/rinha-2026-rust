@@ -11,9 +11,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn warmup(model: &StaticHNSW, iterations: usize) {
     let t = std::time::Instant::now();
-    model.prefetch();
-    println!("Prefetch done in {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
-
     let mut rng = 0x517cc1b727220a95u64;
     for _ in 0..iterations {
         let mut v = [0.0f32; 16];
@@ -36,7 +33,6 @@ fn main() {
     warmup(hnsw_model, 500);
 
     let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .with_entries(256)
         .build()
         .expect("build monoio runtime");
 
@@ -64,9 +60,18 @@ fn main() {
                     };
                     let raw = &bufs.read[..n];
 
+                    macro_rules! write_response {
+                        ($src:expr) => {{
+                            bufs.write.clear();
+                            bufs.write.extend_from_slice($src);
+                            let (res, returned) = stream.write_all(std::mem::take(&mut bufs.write)).await;
+                            bufs.write = returned;
+                            if res.is_err() { break; }
+                        }};
+                    }
+
                     if raw.starts_with(b"GET /ready") {
-                        let response = RESP_READY.to_vec();
-                        if stream.write_all(response).await.0.is_err() { break; }
+                        write_response!(RESP_READY);
                     } else if raw.starts_with(b"POST /fraud-score") {
                         if let Some(body_start) = memchr::memmem::find(raw, b"\r\n\r\n") {
                             let body = &raw[body_start + 4..];
@@ -74,12 +79,10 @@ fn main() {
                                 Some(data) => {
                                     let q = DataNormalizer.normalize(&data);
                                     let fraud_count = hnsw_model.predict(q);
-                                    let response = RESPONSES[fraud_count].to_vec();
-                                    if stream.write_all(response).await.0.is_err() { break; }
+                                    write_response!(RESPONSES[fraud_count]);
                                 }
                                 None => {
-                                    let response = RESP_400.to_vec();
-                                    if stream.write_all(response).await.0.is_err() { break; }
+                                    write_response!(RESP_400);
                                 }
                             }
                         }

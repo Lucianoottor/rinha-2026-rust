@@ -1,5 +1,3 @@
-// ── Public static index ───────────────────────────────────────────────────
-
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -8,8 +6,6 @@ use std::ptr::NonNull;
 use super::distance::{sq_dist_u8, quantize};
 use super::OrdF32;
 use super::NONE;
-
-// ── Generation-counter visited set (O(1) reset) ───────────────────────────
 
 struct VisitedTable {
     marks:      Vec<u32>,
@@ -56,8 +52,6 @@ thread_local! {
     static QBUFS: RefCell<QueryBufs> = RefCell::new(QueryBufs::new());
 }
 
-/// Which allocation backs the hot arrays.
-/// Fields are drop guards only — never read, but must live as long as the raw ptrs.
 #[allow(dead_code)]
 enum Backing {
     Owned {
@@ -65,14 +59,12 @@ enum Backing {
         labels:  Box<[u8]>,
         links0:  Box<[u32]>,
     },
-    /// The Mmap keeps the file mapping alive; raw ptrs point into it.
     Mapped(memmap2::Mmap),
 }
 
 #[allow(dead_code)]
 pub struct StaticHNSW {
     backing:   Backing,
-    /// Points into either the owned Box or the mmap.
     vectors:   NonNull<[u8; 16]>,
     labels:    NonNull<u8>,
     links0:    NonNull<u32>,
@@ -86,29 +78,10 @@ pub struct StaticHNSW {
     k:         usize,
 }
 
-// Safety: raw ptrs are either into Box-owned heap (exclusive) or a
-// read-only mmap (safe to share as immutable data across threads).
 unsafe impl Send for StaticHNSW {}
 unsafe impl Sync for StaticHNSW {}
 
-// ─────────────────────────────────────────────────────────────────────────
-// Binary file layout (little-endian, 48-byte header):
-//   [0..4]   b"HNSW"
-//   [4]      version=2
-//   [5..8]   pad
-//   [8..16]  n: u64
-//   [16..20] m_max0: u32
-//   [20..24] max_level: u32
-//   [24..28] entry: u32
-//   [28..32] ef_search: u32
-//   [32..36] k: u32
-//   [36..40] upper_cnt: u32
-//   [40..48] pad
-//   [48..]   vectors [[u8;16];n], labels [u8;n], (4-aligned) links0 [u32;n*m_max0], upper blob
-// ─────────────────────────────────────────────────────────────────────────
-
 impl StaticHNSW {
-    /// Build a StaticHNSW from the build-phase graph data.
     pub(super) fn from_build_graph(
         vectors: Vec<[f32; 16]>,
         labels: Vec<bool>,
@@ -121,11 +94,9 @@ impl StaticHNSW {
     ) -> Self {
         let n = vectors.len();
 
-        // Quantise f32 → u8 (4× smaller; distance ordering preserved)
         let q_vecs: Vec<[u8; 16]> = vectors.iter().map(quantize).collect();
         let labels:  Vec<u8>      = labels.iter().map(|&b| b as u8).collect();
 
-        // Flat fixed-stride level-0 link array
         let mut links0_vec = vec![NONE; n * m_max0];
         for (id, conns) in connections.iter().enumerate() {
             if conns.is_empty() { continue; }
@@ -133,7 +104,6 @@ impl StaticHNSW {
             for (i, &nb) in conns[0].iter().enumerate() { links0_vec[base + i] = nb; }
         }
 
-        // Upper-level connections (only nodes at level ≥ 1 — small fraction)
         let mut upper: HashMap<u32, Box<[Box<[u32]>]>> = HashMap::new();
         for (id, conns) in connections.iter().enumerate() {
             if conns.len() > 1 {
@@ -148,8 +118,6 @@ impl StaticHNSW {
         let mut lbls_box:  Box<[u8]>       = labels.into_boxed_slice();
         let mut links_box: Box<[u32]>       = links0_vec.into_boxed_slice();
 
-        // Derive raw ptrs before moving boxes into the enum.
-        // Box heap data is stable — address doesn't change on Box move.
         let vptr  = NonNull::new(vecs_box.as_mut_ptr()).unwrap();
         let lptr  = NonNull::new(lbls_box.as_mut_ptr()).unwrap();
         let l0ptr = NonNull::new(links_box.as_mut_ptr()).unwrap();
@@ -170,9 +138,6 @@ impl StaticHNSW {
         }
     }
 
-    /// Touch every page of the hot arrays sequentially to pre-fault them into the OS
-    /// page cache. One byte per 4KB page is enough; sequential access triggers OS
-    /// read-ahead so the actual I/O is pipelined. Call before accepting traffic.
     pub fn prefetch(&self) {
         let vb = unsafe { std::slice::from_raw_parts(self.vectors.as_ptr() as *const u8, self.n * 16) };
         let lb = unsafe { std::slice::from_raw_parts(self.links0.as_ptr() as *const u8, self.links0_n * 4) };
@@ -182,7 +147,6 @@ impl StaticHNSW {
         std::hint::black_box(acc);
     }
 
-    /// Serialize the index to a flat binary file.
     pub fn save(&self, path: &str) {
         use std::io::{BufWriter, Write};
 
@@ -198,7 +162,7 @@ impl StaticHNSW {
         w.write_all(&(self.ef_search as u32).to_le_bytes()).unwrap();
         w.write_all(&(self.k as u32).to_le_bytes()).unwrap();
         w.write_all(&(self.upper.len() as u32).to_le_bytes()).unwrap();
-        w.write_all(&[0u8; 8]).unwrap();  // pad to 48 bytes (4+4+8+4+4+4+4+4+4+8=48)
+        w.write_all(&[0u8; 8]).unwrap();
 
         let vb = unsafe { std::slice::from_raw_parts(self.vectors.as_ptr() as *const u8, self.n * 16) };
         w.write_all(vb).unwrap();
@@ -223,14 +187,11 @@ impl StaticHNSW {
         }
     }
 
-    /// Load from a flat binary file via mmap.
-    /// Both API containers map the same named-volume file; the OS shares pages.
     pub fn load(path: &str) -> Self {
         use memmap2::MmapOptions;
 
         let file = std::fs::File::open(path).expect("open index file");
         let mmap = unsafe { MmapOptions::new().map(&file).expect("mmap index file") };
-        unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()); }
 
         assert_eq!(&mmap[0..4], b"HNSW", "bad magic");
         assert_eq!(mmap[4], 2, "unsupported version");
@@ -245,11 +206,10 @@ impl StaticHNSW {
 
         let vecs_off  = 48usize;
         let lbls_off  = vecs_off + n * 16;
-        let l0_off    = (lbls_off + n + 3) & !3;  // 4-byte aligned
+        let l0_off    = (lbls_off + n + 3) & !3;
         let upper_off = l0_off + n * m_max0 * 4;
         let links0_n  = n * m_max0;
 
-        // Ptrs into mmap; valid for `mmap`'s lifetime (stored in Backing::Mapped below).
         let vectors = NonNull::new(mmap[vecs_off..].as_ptr() as *mut [u8; 16]).unwrap();
         let labels  = NonNull::new(mmap[lbls_off..].as_ptr() as *mut u8).unwrap();
         let links0  = NonNull::new(mmap[l0_off..].as_ptr() as *mut u32).unwrap();
@@ -282,7 +242,6 @@ impl StaticHNSW {
 
     #[inline(always)]
     fn dist_qn(&self, q: &[u8; 16], node: u32) -> f32 {
-        // Safety: node < n by construction throughout build and search.
         sq_dist_u8(q, unsafe { &*self.vectors.as_ptr().add(node as usize) }) as f32
     }
 

@@ -1,5 +1,3 @@
-// ── Build-phase structures (f32, dropped after freeze) ────────────────────
-
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 

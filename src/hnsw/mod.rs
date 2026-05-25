@@ -1,17 +1,9 @@
-//! Static HNSW for 14-dim normalised vectors.
-//!
-//! Build stores f32[16] for accuracy; freeze quantises to u8[16] (4× smaller).
-//! Saved index is a flat binary file; loaded via memmap2 so two Docker
-//! instances share the same physical pages (MAP_SHARED, OS page cache).
-
 mod distance;
 mod build;
 mod index;
 
 pub use index::StaticHNSW;
 pub use build::build_index;
-
-// ── Ordered-float newtype ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);

@@ -14,12 +14,14 @@ pub const RESPONSES: [&[u8]; 6] = [
 
 pub struct ConnBuf {
     pub read: Vec<u8>,
+    pub write: Vec<u8>,
 }
 
 thread_local! {
     static BUF_POOL: RefCell<Vec<ConnBuf>> = RefCell::new(
         (0..16).map(|_| ConnBuf {
             read: Vec::with_capacity(8192),
+            write: Vec::with_capacity(128),
         }).collect()
     );
 }
@@ -29,6 +31,7 @@ impl ConnBuf {
         BUF_POOL.with(|p| {
             p.borrow_mut().pop().unwrap_or_else(|| ConnBuf {
                 read: Vec::with_capacity(8192),
+                write: Vec::with_capacity(128),
             })
         })
     }
@@ -37,8 +40,10 @@ impl ConnBuf {
 impl Drop for ConnBuf {
     fn drop(&mut self) {
         self.read.clear();
+        self.write.clear();
         let buf = ConnBuf {
             read: std::mem::take(&mut self.read),
+            write: std::mem::take(&mut self.write),
         };
         BUF_POOL.with(|p| p.borrow_mut().push(buf));
     }

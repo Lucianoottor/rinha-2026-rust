@@ -12,7 +12,6 @@ fast-float = "0.2"
 memmap2 = "0.9"
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
-libc = "0.2"
 
 [profile.release]
 lto = true
