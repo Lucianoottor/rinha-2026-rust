@@ -35,6 +35,7 @@ fn main() {
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .with_entries(1024)
+        .attach_thread_pool(Box::new(monoio::blocking::DefaultThreadPool::new(1)))
         .build()
         .expect("build monoio runtime");
 
@@ -83,7 +84,9 @@ fn main() {
                             match input::parse_payload(body) {
                                 Some(data) => {
                                     let q = DataNormalizer.normalize(&data);
-                                    let fraud_count = hnsw_model.predict(q);
+                                    let fraud_count = monoio::spawn_blocking(move || hnsw_model.predict(q))
+                                        .await
+                                        .unwrap_or(0);
                                     write_response!(RESPONSES[fraud_count]);
                                 }
                                 None => {
