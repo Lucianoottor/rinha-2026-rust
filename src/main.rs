@@ -1,5 +1,6 @@
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, UnixListener};
+use std::os::unix::fs::PermissionsExt;
 
 use project::hnsw::StaticHNSW;
 use project::input;
@@ -43,6 +44,7 @@ fn main() {
         let opts = ListenerOpts::new().reuse_addr(false).reuse_port(false);
         let listener = UnixListener::bind_with_config(&sock_path, &opts)
             .expect("Failed to bind UDS");
+        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
         println!("Server running on {}", sock_path);
 
         loop {
