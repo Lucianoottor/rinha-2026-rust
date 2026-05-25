@@ -1,26 +1,19 @@
-mod normalizer;
-mod hnsw_static;
-mod types;
-mod input;
-use std::io::Write;
-use std::sync::Arc;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::TcpListener;
+use monoio::net::UnixListener;
 
-use crate::normalizer::DataNormalizer;
+use project::hnsw::StaticHNSW;
+use project::input;
+use project::normalizer::DataNormalizer;
+use project::server::{ConnBuf, RESP_READY, RESP_400, RESPONSES};
 
-/// Run synthetic queries before accepting traffic to:
-/// - Pre-allocate the 12 MB VisitedTable (ensure_capacity on first predict call)
-/// - Fault in the hot mmap pages (upper layers + high-degree nodes) into OS page cache
-/// - Prime CPU branch predictor and instruction cache for the HNSW hot path
-fn warmup(model: &hnsw_static::StaticHNSW, iterations: usize) {
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn warmup(model: &StaticHNSW, iterations: usize) {
     let t = std::time::Instant::now();
-
-    // Phase 1: fault in every mmap page sequentially so real queries never block on I/O
     model.prefetch();
     println!("Prefetch done in {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
 
-    // Phase 2: HNSW queries to size up QBUFS and warm CPU caches
     let mut rng = 0x517cc1b727220a95u64;
     for _ in 0..iterations {
         let mut v = [0.0f32; 16];
@@ -35,66 +28,64 @@ fn warmup(model: &hnsw_static::StaticHNSW, iterations: usize) {
     println!("Warmup done in {:.0}ms total", t.elapsed().as_secs_f64() * 1000.0);
 }
 
-#[monoio::main]
-async fn main() {
+fn main() {
     let index_path = std::env::var("INDEX_PATH")
         .unwrap_or_else(|_| "resources/index.bin".to_string());
-    let knn_model = Arc::new(hnsw_static::StaticHNSW::load(&index_path));
+    let hnsw_model = Box::new(StaticHNSW::load(&index_path));
+    let hnsw_model: &'static StaticHNSW = Box::leak(hnsw_model);
+    warmup(hnsw_model, 500);
 
-    warmup(&knn_model, 500);
+    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(256)
+        .build()
+        .expect("build monoio runtime");
 
-    let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind to port 8080");
-    println!("Server running on http://0.0.0.0:8080");
+    rt.block_on(async move {
+        let sock_path = std::env::var("SOCK_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("Failed to bind UDS");
+        println!("Server running on {}", sock_path);
 
-    loop {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let knn_model = Arc::clone(&knn_model);
-        monoio::spawn(async move {
-            stream.set_nodelay(true).ok();
-            let mut buf = Vec::with_capacity(8192);
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hnsw_model = hnsw_model;
+            monoio::spawn(async move {
+                let mut bufs = ConnBuf::acquire();
 
-            loop {
-                buf.clear();
-                let (res, b) = stream.read(buf).await;
-                buf = b;
+                loop {
+                    bufs.read.clear();
 
-                let n = match res {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                let raw = &buf[..n];
+                    let (res, returned) = stream.read(std::mem::take(&mut bufs.read)).await;
+                    bufs.read = returned;
 
-                let close = raw.windows(17).any(|w| w.eq_ignore_ascii_case(b"connection: close"));
+                    let n = match res {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let raw = &bufs.read[..n];
 
-                if raw.starts_with(b"GET /ready") {
-                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK".to_vec();
-                    if stream.write_all(response).await.0.is_err() { break; }
-                } else if raw.starts_with(b"POST /fraud-score") {
-                    if let Some(body_start) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let body = &raw[body_start + 4..];
-                        match input::parse_payload(body) {
-                            Some(data) => {
-                                let q = DataNormalizer.normalize(&data);
-                                let fraud_score = knn_model.predict(q);
-                                let approved = fraud_score < 0.6;
-                                let body_len = if approved { 35usize } else { 36 };
-                                let mut response = Vec::with_capacity(128);
-                                let _ = write!(
-                                    response,
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: {body_len}\r\n\r\n{{\"approved\":{approved},\"fraud_score\":{fraud_score:.1}}}"
-                                );
-                                if stream.write_all(response).await.0.is_err() { break; }
-                            }
-                            None => {
-                                let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec();
-                                if stream.write_all(response).await.0.is_err() { break; }
+                    if raw.starts_with(b"GET /ready") {
+                        let response = RESP_READY.to_vec();
+                        if stream.write_all(response).await.0.is_err() { break; }
+                    } else if raw.starts_with(b"POST /fraud-score") {
+                        if let Some(body_start) = memchr::memmem::find(raw, b"\r\n\r\n") {
+                            let body = &raw[body_start + 4..];
+                            match input::parse_payload(body) {
+                                Some(data) => {
+                                    let q = DataNormalizer.normalize(&data);
+                                    let fraud_count = hnsw_model.predict(q);
+                                    let response = RESPONSES[fraud_count].to_vec();
+                                    if stream.write_all(response).await.0.is_err() { break; }
+                                }
+                                None => {
+                                    let response = RESP_400.to_vec();
+                                    if stream.write_all(response).await.0.is_err() { break; }
+                                }
                             }
                         }
                     }
                 }
-
-                if close { break; }
-            }
-        });
-    }
+            });
+        }
+    });
 }
