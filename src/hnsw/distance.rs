@@ -1,6 +1,3 @@
-// ── Distance kernels ──────────────────────────────────────────────────────
-
-// f32 path — build phase only
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     target_feature = "avx2",
@@ -44,9 +41,6 @@ pub fn sq_dist_16(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     }
 }
 
-// u8 path — query phase
-// _mm256_cvtepu8_epi16: 16×u8 → 16×i16 (one 128-bit load → 256-bit)
-// _mm256_madd_epi16(d,d): adjacent pairs of i16 squares summed → 8×i32
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -56,7 +50,7 @@ unsafe fn sq_dist_u8_avx2(a: *const u8, b: *const u8) -> u32 {
         let a16  = _mm256_cvtepu8_epi16(_mm_loadu_si128(a as *const __m128i));
         let b16  = _mm256_cvtepu8_epi16(_mm_loadu_si128(b as *const __m128i));
         let diff = _mm256_sub_epi16(a16, b16);
-        let sq   = _mm256_madd_epi16(diff, diff);  // 8×i32
+        let sq   = _mm256_madd_epi16(diff, diff);
         let lo   = _mm256_castsi256_si128(sq);
         let hi   = _mm256_extracti128_si256(sq, 1);
         let s4   = _mm_add_epi32(lo, hi);
@@ -78,7 +72,6 @@ pub fn sq_dist_u8(a: &[u8; 16], b: &[u8; 16]) -> u32 {
     }
 }
 
-/// Map [0,1] f32 → u8.  Values outside range are clamped.
 #[inline(always)]
 pub fn quantize(v: &[f32; 16]) -> [u8; 16] {
     let mut q = [0u8; 16];

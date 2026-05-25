@@ -6,13 +6,9 @@ impl DataNormalizer {
     pub fn normalize(&self, data: &Payload<'_>) -> [f32; 16] {
         let mut v = [0.0f32; 16];
 
-        // 0: amount
         v[0] = clamp(data.amount, 10000.0);
-
-        // 1: installments
         v[1] = clamp(data.installments as f32, 12.0);
 
-        // 2: amount_vs_avg
         let ratio = if data.customer_avg_amount > 0.0 {
             data.amount / data.customer_avg_amount
         } else {
@@ -20,13 +16,9 @@ impl DataNormalizer {
         };
         v[2] = clamp(ratio, 10.0);
 
-        // 3: hour_of_day
         v[3] = ts_hour(data.requested_at);
-
-        // 4: day_of_week
         v[4] = ts_weekday(data.requested_at);
 
-        // 5 & 6: last transaction timing and distance
         match (data.last_timestamp, data.last_km) {
             (Some(ts), Some(km)) => {
                 let minutes = ts_to_minutes(data.requested_at) - ts_to_minutes(ts);
@@ -39,32 +31,20 @@ impl DataNormalizer {
             }
         }
 
-        // 7: km_from_home
         v[7] = clamp(data.km_from_home, 1000.0);
-
-        // 8: tx_count_24h
         v[8] = clamp(data.tx_count_24h as f32, 20.0);
-
-        // 9: is_online
         v[9] = if data.is_online { 1.0 } else { 0.0 };
-
-        // 10: card_present
         v[10] = if data.card_present { 1.0 } else { 0.0 };
 
-        // 11: unknown_merchant
         let id = data.merchant_id;
         let is_known = data.known_merchants
             .windows(id.len() + 2)
             .any(|w| w[0] == b'"' && &w[1..w.len() - 1] == id && w[w.len() - 1] == b'"');
         v[11] = if is_known { 0.0 } else { 1.0 };
 
-        // 12: mcc_risk
         v[12] = comp_mcc(data.merchant_mcc);
-
-        // 13: merchant_avg_amount
         v[13] = clamp(data.merchant_avg_amount, 10000.0);
 
-        // 14 & 15: padding zeros (already 0.0 from init)
         v
     }
 }
@@ -104,7 +84,6 @@ fn b4(b: &[u8]) -> u32 {
         + (b[3] - b'0') as u32
 }
 
-
 #[inline]
 fn ymd_to_days(y: u32, m: u32, d: u32) -> i64 {
     let a = (14 - m) / 12;
@@ -119,7 +98,6 @@ fn ts_to_minutes(b: &[u8]) -> i64 {
         + b2(&b[11..13]) as i64 * 60
         + b2(&b[14..16]) as i64
 }
-
 
 #[inline(always)]
 fn ts_hour(b: &[u8]) -> f32 {
@@ -137,15 +115,12 @@ fn ts_weekday(b: &[u8]) -> f32 {
     ((dow + 6) % 7) as f32 / 6.0
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_ts_hour() {
-        // 18:45 → 18/23
         assert_eq!(ts_hour(b"2026-03-11T18:45:53Z"), 18.0 / 23.0);
         assert_eq!(ts_hour(b"2026-03-11T00:00:00Z"), 0.0);
         assert_eq!(ts_hour(b"2026-03-11T23:59:59Z"), 1.0);
@@ -153,17 +128,13 @@ mod tests {
 
     #[test]
     fn test_ts_weekday() {
-        // 2026-03-11 is a Wednesday → num_days_from_monday = 2
         assert_eq!(ts_weekday(b"2026-03-11T00:00:00Z"), 2.0 / 6.0);
-        // 2026-03-09 is a Monday → 0
         assert_eq!(ts_weekday(b"2026-03-09T00:00:00Z"), 0.0 / 6.0);
-        // 2026-03-15 is a Sunday → 6
         assert_eq!(ts_weekday(b"2026-03-15T00:00:00Z"), 6.0 / 6.0);
     }
 
     #[test]
     fn test_ts_minutes_diff() {
-        // 20:23 - 14:58 on the same day = 325 minutes
         let a = b"2026-03-11T20:23:35Z";
         let b = b"2026-03-11T14:58:35Z";
         assert_eq!(ts_to_minutes(a) - ts_to_minutes(b), 325);
