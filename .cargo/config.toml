@@ -3,4 +3,4 @@
 # resolve at compile time, so the distance kernel emits 2× VSUB + VFMADD
 # with no runtime dispatch overhead.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-feature=+avx2,+fma"]
+rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma"]

@@ -2,6 +2,10 @@ services:
   api-1:
     platform: linux/amd64
     build: .
+    environment:
+      - SOCK_PATH=/sockets/api1.sock
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -11,6 +15,10 @@ services:
   api-2:
     platform: linux/amd64
     build: .
+    environment:
+      - SOCK_PATH=/sockets/api2.sock
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -24,6 +32,7 @@ services:
       - "9999:9999"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/sockets
     depends_on:
       - api-1
       - api-2
@@ -32,3 +41,9 @@ services:
         limits:
           cpus: "0.1"
           memory: "20M"
+
+volumes:
+  sockets:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
