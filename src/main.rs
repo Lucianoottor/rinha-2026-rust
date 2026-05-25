@@ -1,5 +1,6 @@
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::UnixListener;
+use std::os::unix::net::UnixListener as StdUnixListener;
 
 use project::hnsw::StaticHNSW;
 use project::input;
@@ -40,7 +41,10 @@ fn main() {
     rt.block_on(async move {
         let sock_path = std::env::var("SOCK_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("Failed to bind UDS");
+        let std_listener = StdUnixListener::bind(&sock_path)
+            .expect("Failed to bind UDS");
+        std_listener.set_nonblocking(true).expect("set_nonblocking");
+        let listener = UnixListener::from_std(std_listener).expect("from_std");
         println!("Server running on {}", sock_path);
 
         loop {
