@@ -191,7 +191,8 @@ impl StaticHNSW {
         use memmap2::MmapOptions;
 
         let file = std::fs::File::open(path).expect("open index file");
-        let mmap = unsafe { MmapOptions::new().map(&file).expect("mmap index file") };
+        let mmap = unsafe { MmapOptions::new().populate().map(&file).expect("mmap index file") };
+        mmap.advise(memmap2::Advice::Random).ok();
 
         assert_eq!(&mmap[0..4], b"HNSW", "bad magic");
         assert_eq!(mmap[4], 2, "unsupported version");
