@@ -31,7 +31,7 @@ fn main() {
         .unwrap_or_else(|_| "resources/index.bin".to_string());
     let hnsw_model = Box::new(StaticHNSW::load(&index_path));
     let hnsw_model: &'static StaticHNSW = Box::leak(hnsw_model);
-    warmup(hnsw_model, 500);
+    
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .with_entries(1024)
@@ -39,6 +39,7 @@ fn main() {
         .expect("build monoio runtime");
 
     rt.block_on(async move {
+        warmup(hnsw_model, 500);
         let sock_path = std::env::var("SOCK_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
         let _ = std::fs::remove_file(&sock_path);
         let opts = ListenerOpts::new().reuse_addr(false).reuse_port(false);
@@ -83,7 +84,7 @@ fn main() {
                             match input::parse_payload(body) {
                                 Some(data) => {
                                     let q = DataNormalizer.normalize(&data);
-                                    let fraud_count = monoio::spawn_blocking(move || hnsw_model.predict(q)).await.unwrap_or(0);
+                                    let fraud_count = hnsw_model.predict(q);
                                     write_response!(RESPONSES[fraud_count]);
                                 }
                                 None => {
