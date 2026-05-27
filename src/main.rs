@@ -2,7 +2,7 @@ use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, UnixListener};
 use std::os::unix::fs::PermissionsExt;
 
-use project::hnsw::StaticHNSW;
+use project::IVF::StaticIVF;
 use project::input;
 use project::normalizer::DataNormalizer;
 use project::server::{ConnBuf, RESP_READY, RESP_400, RESPONSES};
@@ -10,7 +10,7 @@ use project::server::{ConnBuf, RESP_READY, RESP_400, RESPONSES};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn warmup(model: &StaticHNSW, iterations: usize) {
+fn warmup(model: &StaticIVF, iterations: usize) {
     let t = std::time::Instant::now();
     let mut rng = 0x517cc1b727220a95u64;
     for _ in 0..iterations {
@@ -28,10 +28,10 @@ fn warmup(model: &StaticHNSW, iterations: usize) {
 
 fn main() {
     let index_path = std::env::var("INDEX_PATH")
-        .unwrap_or_else(|_| "resources/index.bin".to_string());
-    let hnsw_model = Box::new(StaticHNSW::load(&index_path));
-    let hnsw_model: &'static StaticHNSW = Box::leak(hnsw_model);
-    
+        .unwrap_or_else(|_| "resources/index.ivf".to_string());
+
+    let model = Box::new(StaticIVF::load(&index_path));
+    let model: &'static StaticIVF = Box::leak(model);
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .with_entries(1024)
@@ -39,18 +39,20 @@ fn main() {
         .expect("build monoio runtime");
 
     rt.block_on(async move {
-        warmup(hnsw_model, 500);
-        let sock_path = std::env::var("SOCK_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
+        warmup(model, 500);
+
+        let sock_path = std::env::var("SOCK_PATH")
+            .unwrap_or_else(|_| "/tmp/api.sock".to_string());
         let _ = std::fs::remove_file(&sock_path);
         let opts = ListenerOpts::new().reuse_addr(false).reuse_port(false);
         let listener = UnixListener::bind_with_config(&sock_path, &opts)
             .expect("Failed to bind UDS");
         let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
-        println!("Server running on {}", sock_path);
+        println!("Server running on {sock_path}");
 
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let hnsw_model = hnsw_model;
+            let model = model;
             monoio::spawn(async move {
                 let mut bufs = ConnBuf::acquire();
 
@@ -70,7 +72,8 @@ fn main() {
                         ($src:expr) => {{
                             bufs.write.clear();
                             bufs.write.extend_from_slice($src);
-                            let (res, returned) = stream.write_all(std::mem::take(&mut bufs.write)).await;
+                            let (res, returned) =
+                                stream.write_all(std::mem::take(&mut bufs.write)).await;
                             bufs.write = returned;
                             if res.is_err() { break; }
                         }};
@@ -84,7 +87,7 @@ fn main() {
                             match input::parse_payload(body) {
                                 Some(data) => {
                                     let q = DataNormalizer.normalize(&data);
-                                    let fraud_count = hnsw_model.predict(q);
+                                    let fraud_count = model.predict(q);
                                     write_response!(RESPONSES[fraud_count]);
                                 }
                                 None => {
