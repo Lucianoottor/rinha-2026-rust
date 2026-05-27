@@ -6,6 +6,8 @@ services:
       - SOCK_PATH=/sockets/api1.sock
     volumes:
       - sockets:/sockets
+    security_opt:
+        - seccomp:unconfined
     deploy:
       resources:
         limits:
@@ -18,6 +20,8 @@ services:
       - SOCK_PATH=/sockets/api2.sock
     volumes:
       - sockets:/sockets
+    security_opt:
+        - seccomp:unconfined
     deploy:
       resources:
         limits:
