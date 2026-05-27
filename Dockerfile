@@ -1,21 +1,13 @@
-FROM rust:latest AS compiler
+FROM rust:latest AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 RUN cargo build --release
-
-FROM debian:bookworm-slim AS index-builder
-WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends libgcc-s1 && rm -rf /var/lib/apt/lists/*
-COPY --from=compiler /app/target/release/indexer ./indexer
-COPY src/resources/references.json.gz ./references.json.gz
-RUN DATA_PATH=references.json.gz INDEX_PATH=index.bin ./indexer
+# Generate the index during build — self-contained, no pre-built file needed
+RUN cp -r src/resources resources && ./target/release/indexer
 
 FROM debian:bookworm-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends libgcc-s1 && rm -rf /var/lib/apt/lists/*
-COPY --from=compiler /app/target/release/project ./project
-COPY --from=index-builder /app/index.bin ./index.bin
-EXPOSE 8080
-ENV INDEX_PATH=/app/index.bin
+COPY --from=builder /app/target/release/project ./project
+COPY --from=builder /app/resources ./resources
 CMD ["./project"]
