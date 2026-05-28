@@ -1,20 +1,16 @@
-FROM rust:latest AS planner
-WORKDIR /app
-RUN cargo install cargo-chef
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
 FROM rust:latest AS builder
 WORKDIR /app
-RUN cargo install cargo-chef
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
 
-COPY src ./src
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
 COPY Cargo.toml Cargo.lock* ./
 
 RUN cargo build --release
+RUN rm -f target/release/deps/project* target/release/project*
 
+COPY src ./src
+
+RUN cargo build --release
 RUN cp -r src/resources resources && ./target/release/indexer
 
 FROM debian:bookworm-slim
