@@ -2,7 +2,6 @@ FROM rust:latest AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-RUN cargo build --release
 RUN cp -r src/resources resources && ./target/release/indexer
 
 FROM debian:bookworm-slim
