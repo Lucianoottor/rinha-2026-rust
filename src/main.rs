@@ -33,22 +33,21 @@ fn main() {
     let model = Box::new(StaticIVF::load(&index_path));
     let model: &'static StaticIVF = Box::leak(model);
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+    let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
         .with_entries(1024)
         .build()
         .expect("build monoio runtime");
 
     rt.block_on(async move {
-        warmup(model, 500);
-
         let sock_path = std::env::var("SOCK_PATH")
             .unwrap_or_else(|_| "/tmp/api.sock".to_string());
         let _ = std::fs::remove_file(&sock_path);
         let opts = ListenerOpts::new().reuse_addr(false).reuse_port(false);
         let listener = UnixListener::bind_with_config(&sock_path, &opts)
             .expect("Failed to bind UDS");
-        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
         println!("Server running on {sock_path}");
+
+        warmup(model, 500);
 
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();

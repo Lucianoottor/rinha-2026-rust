@@ -1,4 +1,3 @@
-pub mod hnsw;       // kept for reference; not used by main binary anymore
 pub mod input;
 pub mod loader;
 pub mod normalizer;
