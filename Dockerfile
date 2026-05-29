@@ -4,7 +4,8 @@ WORKDIR /app
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 COPY Cargo.toml Cargo.lock* ./
-COPY .cargo .cargo
+ARG RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma"
+ENV RUSTFLAGS=${RUSTFLAGS}
 
 RUN cargo build --release
 RUN rm -f target/release/deps/project* target/release/project*
