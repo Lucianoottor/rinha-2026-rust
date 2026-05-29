@@ -1,16 +1,11 @@
 use std::ptr::NonNull;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 const HEADER:  usize = 32;
 const MAGIC:   &[u8] = b"IVF1";
 const VERSION: u8    = 1;
 
-/// Hard upper bounds (stack-allocated scratch in predict, no heap touch in hot path).
 const MAX_NPROBE: usize = 32;
 const MAX_K:      usize = 32;
-
-// ── Distance & quantization ───────────────────────────────────────────────────
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
@@ -31,7 +26,6 @@ unsafe fn sq_dist_u8_avx2(a: *const u8, b: *const u8) -> u32 {
     }
 }
 
-/// Squared L2 distance between two quantized 16-d vectors.
 #[inline(always)]
 pub(super) fn sq_dist_u8(a: &[u8; 16], b: &[u8; 16]) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -47,7 +41,6 @@ pub(super) fn sq_dist_u8(a: &[u8; 16], b: &[u8; 16]) -> u32 {
     }
 }
 
-/// Map [−1, 1] f32 → u8.  Must match the same mapping used at build time.
 #[inline(always)]
 pub(super) fn quantize(v: &[f32; 16]) -> [u8; 16] {
     let mut q = [0u8; 16];
@@ -57,17 +50,12 @@ pub(super) fn quantize(v: &[f32; 16]) -> [u8; 16] {
     q
 }
 
-// ── Bucket metadata (8 bytes, C-repr for direct mmap access) ─────────────────
-
-/// Offset and length of one Voronoi cell inside the sorted vector array.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct BucketMeta {
     pub start: u32,
     pub len:   u32,
 }
-
-// ── Backing storage ───────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 enum Backing {
@@ -80,51 +68,23 @@ enum Backing {
     Mapped(memmap2::Mmap),
 }
 
-// ── Public index struct ───────────────────────────────────────────────────────
-
-/// Flat IVF index backed by either owned memory (after build) or an mmap'd file.
-///
-/// Two instances pointing at the same file share physical pages through the OS
-/// page cache — identical to the previous HNSW approach, but at ~51 MB vs the
-/// HNSW's ~240 MB for 3 M vectors.
 #[allow(dead_code)]
 pub struct StaticIVF {
     backing:     Backing,
-    centroids:   NonNull<[u8; 16]>,   // n_centroids quantized centroids
-    buckets:     NonNull<BucketMeta>, // n_centroids × (start, len)
-    vectors:     NonNull<[u8; 16]>,   // n vectors, sorted by centroid assignment
-    labels:      NonNull<u8>,         // n labels (0 = legit, 1 = fraud)
+    centroids:   NonNull<[u8; 16]>,
+    buckets:     NonNull<BucketMeta>,
+    vectors:     NonNull<[u8; 16]>,
+    labels:      NonNull<u8>,
     n:           usize,
     n_centroids: usize,
-    nprobe:      usize,               // embedded in file; controls recall vs speed
-    k:           usize,               // k-NN count; indexes into server::RESPONSES
+    nprobe:      usize,
+    k:           usize,
 }
 
 unsafe impl Send for StaticIVF {}
 unsafe impl Sync for StaticIVF {}
 
-// ── Binary file layout ────────────────────────────────────────────────────────
-//
-//  [0..4]   b"IVF1"
-//  [4]      version = 1
-//  [5..8]   pad
-//  [8..12]  n_centroids : u32
-//  [12..16] nprobe      : u32
-//  [16..20] k           : u32
-//  [20..24] pad
-//  [24..32] n           : u64
-//  ── HEADER = 32 bytes ──
-//  [32 ..]                  centroids  [u8;16] × n_centroids
-//  [32 + n_c*16 ..]         buckets    (start:u32, len:u32) × n_centroids
-//  [prev + n_c*8 ..]        vectors    [u8;16] × n   (bucket-sorted)
-//  [prev + n*16 ..]         labels     [u8] × n
-//
-// File size for n=3 M, n_c=1024:
-//   32 + 1024*16 + 1024*8 + 3_000_000*16 + 3_000_000 = ~51 MB
-
 impl StaticIVF {
-    // ── Internal constructor (builder → index) ────────────────────────────
-
     pub(super) fn from_parts(
         centroids: Vec<[u8; 16]>,
         buckets:   Vec<BucketMeta>,
@@ -161,8 +121,6 @@ impl StaticIVF {
         }
     }
 
-    // ── Persistence ───────────────────────────────────────────────────────
-
     pub fn save(&self, path: &str) {
         use std::io::{BufWriter, Write};
 
@@ -174,8 +132,8 @@ impl StaticIVF {
         w.write_all(&(self.n_centroids as u32).to_le_bytes()).unwrap();
         w.write_all(&(self.nprobe      as u32).to_le_bytes()).unwrap();
         w.write_all(&(self.k           as u32).to_le_bytes()).unwrap();
-        w.write_all(&[0u8; 4]).unwrap();                                // pad [20..24]
-        w.write_all(&(self.n           as u64).to_le_bytes()).unwrap(); // [24..32]
+        w.write_all(&[0u8; 4]).unwrap();
+        w.write_all(&(self.n           as u64).to_le_bytes()).unwrap();
 
         let cb = unsafe { std::slice::from_raw_parts(
             self.centroids.as_ptr() as *const u8, self.n_centroids * 16) };
@@ -197,7 +155,6 @@ impl StaticIVF {
         use memmap2::MmapOptions;
 
         let file = std::fs::File::open(path).expect("open IVF file");
-        // populate() faults in all pages immediately so queries see no page faults.
         let mmap = unsafe {
             MmapOptions::new().populate().map(&file).expect("mmap IVF file")
         };
@@ -227,8 +184,6 @@ impl StaticIVF {
         }
     }
 
-    // ── Warm-up (touch every page once so queries run cold-free) ─────────
-
     pub fn prefetch(&self) {
         let vb = unsafe { std::slice::from_raw_parts(
             self.vectors.as_ptr() as *const u8, self.n * 16) };
@@ -238,19 +193,6 @@ impl StaticIVF {
         for chunk in lb.chunks(4096) { acc = acc.wrapping_add(chunk[0]); }
         std::hint::black_box(acc);
     }
-
-    // ── Query ─────────────────────────────────────────────────────────────
-    //
-    // Hot path — zero heap allocations:
-    //   • centroid selection uses stack arrays (nprobe ≤ MAX_NPROBE = 32)
-    //   • k-NN result uses stack arrays   (k      ≤ MAX_K      = 32)
-    //
-    // Algorithm:
-    //   1. Compute sq-dist from query to every centroid (SIMD u8 kernel).
-    //   2. Pick the nprobe nearest centroids with a linear max-replacement scan.
-    //   3. Iterate over each probed bucket sequentially, maintaining a
-    //      size-k max-heap of (dist, label) on the stack.
-    //   4. Return count of fraud labels in the heap.
 
     #[inline]
     pub fn predict(&self, q: [f32; 16]) -> usize {
@@ -265,11 +207,6 @@ impl StaticIVF {
         let centroids = unsafe { std::slice::from_raw_parts(self.centroids.as_ptr(), n_centroids) };
         let buckets   = unsafe { std::slice::from_raw_parts(self.buckets.as_ptr(),   n_centroids) };
 
-        // ── Step 1 + 2: find nprobe nearest centroids in one pass ────────
-        //
-        // Maintain a size-nprobe set as a flat array with explicit tracking
-        // of the worst (largest-dist) entry.  Replacement cost = O(nprobe) ≤ 32.
-
         let mut top_dists = [u32::MAX; MAX_NPROBE];
         let mut top_ids   = [0u32;     MAX_NPROBE];
         let mut worst_top_dist = u32::MAX;
@@ -280,13 +217,11 @@ impl StaticIVF {
             let d = sq_dist_u8(&q8, &centroids[c]);
 
             if filled < nprobe {
-                // Fill up the first nprobe slots without pruning.
                 top_dists[filled] = d;
                 top_ids[filled]   = c as u32;
                 filled += 1;
 
                 if filled == nprobe {
-                    // Compute initial worst so pruning kicks in from here.
                     worst_top_dist = 0;
                     for i in 0..nprobe {
                         if top_dists[i] > worst_top_dist {
@@ -298,7 +233,6 @@ impl StaticIVF {
             } else if d < worst_top_dist {
                 top_dists[worst_top_pos] = d;
                 top_ids[worst_top_pos]   = c as u32;
-                // Recompute worst among the nprobe slots.
                 worst_top_dist = 0;
                 for i in 0..nprobe {
                     if top_dists[i] > worst_top_dist {
@@ -308,8 +242,6 @@ impl StaticIVF {
                 }
             }
         }
-
-        // ── Step 3: scan probed buckets, maintain size-k result set ──────
 
         let mut knn_dist  = [u32::MAX; MAX_K];
         let mut knn_label = [0u8;      MAX_K];
@@ -333,7 +265,6 @@ impl StaticIVF {
                     knn_size += 1;
 
                     if knn_size == k {
-                        // Compute initial worst; pruning starts now.
                         worst_knn_dist = 0;
                         for j in 0..k {
                             if knn_dist[j] > worst_knn_dist {
@@ -356,7 +287,6 @@ impl StaticIVF {
             }
         }
 
-        // ── Step 4: count fraud labels in k-NN ───────────────────────────
         knn_label[..knn_size].iter().filter(|&&l| l != 0).count()
     }
 }

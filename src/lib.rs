@@ -1,3 +1,4 @@
+pub mod event_loop;
 pub mod input;
 pub mod loader;
 pub mod normalizer;

@@ -4,6 +4,7 @@ WORKDIR /app
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 COPY Cargo.toml Cargo.lock* ./
+COPY .cargo .cargo
 
 RUN cargo build --release
 RUN rm -f target/release/deps/project* target/release/project*
@@ -17,6 +18,7 @@ FROM debian:bookworm-slim
 WORKDIR /app
 
 COPY --from=builder /app/target/release/project ./project
+COPY --from=builder /app/target/release/healthcheck ./healthcheck
 COPY --from=builder /app/resources ./resources
 
 CMD ["./project"]

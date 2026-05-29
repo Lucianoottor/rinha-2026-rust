@@ -48,3 +48,26 @@ impl Drop for ConnBuf {
         BUF_POOL.with(|p| p.borrow_mut().push(buf));
     }
 }
+
+pub fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    const TAG: &[u8] = b"content-length:";
+    let mut i = 0;
+    while i + TAG.len() <= headers.len() {
+        if headers[i..i + TAG.len()].eq_ignore_ascii_case(TAG) {
+            let rest = &headers[i + TAG.len()..];
+            let skip = rest.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            let mut n = 0usize;
+            let mut hit = false;
+            for &b in &rest[skip..] {
+                if b.is_ascii_digit() { n = n * 10 + (b - b'0') as usize; hit = true; }
+                else { break; }
+            }
+            return hit.then_some(n);
+        }
+        match memchr::memchr(b'\n', &headers[i..]) {
+            Some(nl) => i += nl + 1,
+            None => break,
+        }
+    }
+    None
+}
