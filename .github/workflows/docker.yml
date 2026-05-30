@@ -26,4 +26,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/lucianoottor/rinha-2026-rust:latest
+          tags: ghcr.io/Lucianoottor/rinha-2026-rust:latest
