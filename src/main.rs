@@ -1,10 +1,10 @@
-use project::IVF::StaticIVF;
+use project::tree::TreeIndex;
 use project::event_loop;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn warmup(model: &StaticIVF, iterations: usize) {
+fn warmup(model: &TreeIndex, iterations: usize) {
     let t = std::time::Instant::now();
     let mut rng = 0x517cc1b727220a95u64;
     for _ in 0..iterations {
@@ -22,10 +22,11 @@ fn warmup(model: &StaticIVF, iterations: usize) {
 
 fn main() {
     let index_path = std::env::var("INDEX_PATH")
-        .unwrap_or_else(|_| "resources/index.ivf".to_string());
+        .unwrap_or_else(|_| "resources/index.kdt".to_string());
 
-    let model = Box::new(StaticIVF::load(&index_path));
-    let model: &'static StaticIVF = Box::leak(model);
+    let model = Box::new(TreeIndex::load(&index_path));
+    model.pretouch();
+    let model: &'static TreeIndex = Box::leak(model);
 
     warmup(model, 500);
 

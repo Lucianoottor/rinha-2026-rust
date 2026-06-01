@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, vec};
 
 pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
 pub const RESP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
@@ -20,8 +20,8 @@ pub struct ConnBuf {
 thread_local! {
     static BUF_POOL: RefCell<Vec<ConnBuf>> = RefCell::new(
         (0..16).map(|_| ConnBuf {
-            read: Vec::with_capacity(8192),
-            write: Vec::with_capacity(128),
+            read: vec![0u8; 8192],
+            write: vec![0u8; 128],
         }).collect()
     );
 }
@@ -49,6 +49,7 @@ impl Drop for ConnBuf {
     }
 }
 
+#[inline(always)]
 pub fn parse_content_length(headers: &[u8]) -> Option<usize> {
     const TAG: &[u8] = b"content-length:";
     let mut i = 0;

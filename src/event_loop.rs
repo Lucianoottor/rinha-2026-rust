@@ -1,13 +1,15 @@
-use std::collections::HashMap;
-
 use libc;
+use std::os::unix::io::RawFd;
 
 use crate::input;
 use crate::normalizer::DataNormalizer;
 use crate::server::{parse_content_length, RESP_400, RESP_READY, RESPONSES};
-use crate::IVF::StaticIVF;
+use crate::tree::TreeIndex;
 
-const BUF_CAP: usize = 8192;
+
+const MAX_FDS: usize = 4096;
+const BUF_CAP: usize = 8192; 
+
 const READ_FLAGS: u32 = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
 const WRITE_FLAGS: u32 = (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP) as u32;
 
@@ -19,11 +21,22 @@ struct Conn {
 }
 
 impl Conn {
-    fn new() -> Self {
-        Self { rbuf: vec![0u8; BUF_CAP], filled: 0, resp: b"", written: 0 }
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            rbuf: vec![0u8; cap],
+            filled: 0,
+            resp: b"",
+            written: 0,
+        }
     }
 
-    fn process(&mut self, model: &StaticIVF) -> bool {
+    fn reset(&mut self) {
+        self.filled = 0;
+        self.resp = b"";
+        self.written = 0;
+    }
+    #[inline(always)]
+    fn process(&mut self, model: &TreeIndex) -> bool {
         let raw = &self.rbuf[..self.filled];
 
         if raw.starts_with(b"GET /ready") {
@@ -37,6 +50,15 @@ impl Conn {
             if let Some(hdr_end) = memchr::memmem::find(raw, b"\r\n\r\n") {
                 let cl = parse_content_length(&raw[..hdr_end]).unwrap_or(0);
                 let body_start = hdr_end + 4;
+                
+                // Hard validation: Does the client payload fit our fixed-size buffer?
+                if body_start + cl > self.rbuf.len() {
+                    self.resp = RESP_400;
+                    self.written = 0;
+                    self.filled = 0;
+                    return true;
+                }
+
                 if self.filled >= body_start + cl {
                     let body = &self.rbuf[body_start..body_start + cl];
                     self.resp = match input::parse_payload(body) {
@@ -52,7 +74,6 @@ impl Conn {
                 }
             }
         }
-
         false
     }
 }
@@ -70,38 +91,45 @@ fn epoll_mod(epfd: i32, fd: i32, events: u32) {
     unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev); }
 }
 
-fn drop_conn(epfd: i32, fd: i32, conns: &mut HashMap<i32, Conn>) {
+fn drop_conn(epfd: i32, fd: i32, conns: &mut [Option<Conn>]) {
     unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()); }
     unsafe { libc::close(fd); }
-    conns.remove(&fd);
+    if let Some(slot) = conns.get_mut(fd as usize) {
+        if let Some(conn) = slot {
+            conn.reset(); // Clear trackers but preserve the allocated vector capacity
+        }
+        *slot = None; // Return slot occupancy back to None
+    }
 }
 
-fn do_read(fd: i32, conns: &mut HashMap<i32, Conn>, model: &StaticIVF) -> ReadResult {
-    let conn = match conns.get_mut(&fd) {
+fn do_read(fd: i32, conns: &mut [Option<Conn>], model: &TreeIndex) -> ReadResult {
+    // O(1) direct index lookup instead of a hashing function
+    let conn = match conns.get_mut(fd as usize).and_then(|c| c.as_mut()) {
         Some(c) => c,
         None => return ReadResult::Close,
     };
 
-    loop {
-        if conn.filled == conn.rbuf.len() {
-            conn.rbuf.resize(conn.rbuf.len() + BUF_CAP, 0);
-        }
-        let room = conn.rbuf.len() - conn.filled;
+    // REMOVED internal loop: Read only once per epoll trigger to avoid stalling other sockets
+    let room = conn.rbuf.len() - conn.filled;
+    if room == 0 {
+        // Buffer full but request still incomplete: payload exceeds BUF_CAP capacity
+        return ReadResult::Close;
+    }
 
-        let n = unsafe {
-            libc::recv(fd, conn.rbuf[conn.filled..].as_mut_ptr() as *mut _, room, 0)
-        };
+    let n = unsafe {
+        libc::recv(fd, conn.rbuf[conn.filled..].as_mut_ptr() as *mut _, room, 0)
+    };
 
-        if n > 0 {
-            conn.filled += n as usize;
-            if conn.process(model) { return ReadResult::Respond; }
-        } else if n == 0 {
-            return ReadResult::Close;
-        } else {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::WouldBlock { return ReadResult::Wait; }
-            return ReadResult::Close;
-        }
+    if n > 0 {
+        conn.filled += n as usize;
+        if conn.process(model) { return ReadResult::Respond; }
+        ReadResult::Wait
+    } else if n == 0 {
+        ReadResult::Close
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock { return ReadResult::Wait; }
+        ReadResult::Close
     }
 }
 
@@ -122,13 +150,21 @@ fn do_send(fd: i32, conn: &mut Conn) -> SendResult {
     SendResult::Done
 }
 
-pub fn run(sock_path: &str, model: &'static StaticIVF) {
+pub fn run(sock_path: &str, model: &'static TreeIndex) {
     let lfd = create_listener(sock_path);
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epfd >= 0);
     epoll_add(epfd, lfd, libc::EPOLLIN as u32);
 
-    let mut conns: HashMap<i32, Conn> = HashMap::new();
+    // PRE-ALLOCATED STORAGE: Memory footprint is bounded and deterministic right at startup
+    let mut conns: Vec<Option<Conn>> = (0..MAX_FDS)
+        .map(|_| Some(Conn::with_capacity(BUF_CAP)))
+        .collect();
+        
+    // Initially set all slots to None while preserving their inner capacity structures
+    let mut conn_pool: Vec<Conn> = conns.drain(..).filter_map(|c| c).collect();
+    let mut active_conns: Vec<Option<Conn>> = (0..MAX_FDS).map(|_| None).collect();
+
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 256];
 
     loop {
@@ -146,27 +182,59 @@ pub fn run(sock_path: &str, model: &'static StaticIVF) {
                                       libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
                     };
                     if cfd < 0 { break; }
-                    conns.insert(cfd, Conn::new());
-                    epoll_add(epfd, cfd, READ_FLAGS);
+                    
+                    if cfd >= MAX_FDS as i32 {
+                        unsafe { libc::close(cfd); }
+                        continue;
+                    }
+
+                    // Zero Allocation: Reuse an existing structured buffer from our pool
+                    if let Some(mut pooled_conn) = conn_pool.pop() {
+                        pooled_conn.reset();
+                        active_conns[cfd as usize] = Some(pooled_conn);
+                        epoll_add(epfd, cfd, READ_FLAGS);
+                    } else {
+                        // Max concurrent connections reached; drop to protect resources
+                        unsafe { libc::close(cfd); }
+                    }
                 }
                 continue;
             }
 
             if ev & (libc::EPOLLHUP | libc::EPOLLERR | libc::EPOLLRDHUP) as u32 != 0 {
-                drop_conn(epfd, fd, &mut conns);
+                if let Some(Some(conn)) = active_conns.get_mut(fd as usize) {
+                    let mut taken_conn = active_conns[fd as usize].take().unwrap();
+                    taken_conn.reset();
+                    conn_pool.push(taken_conn);
+                }
+                drop_conn(epfd, fd, &mut active_conns);
                 continue;
             }
 
             if ev & libc::EPOLLIN as u32 != 0 {
-                match do_read(fd, &mut conns, model) {
-                    ReadResult::Close => { drop_conn(epfd, fd, &mut conns); continue; }
+                match do_read(fd, &mut active_conns, model) {
+                    ReadResult::Close => { 
+                        if let Some(Some(_)) = active_conns.get_mut(fd as usize) {
+                            let mut taken_conn = active_conns[fd as usize].take().unwrap();
+                            taken_conn.reset();
+                            conn_pool.push(taken_conn);
+                        }
+                        drop_conn(epfd, fd, &mut active_conns); 
+                        continue; 
+                    }
                     ReadResult::Wait  => {}
                     ReadResult::Respond => {
-                        if let Some(c) = conns.get_mut(&fd) {
+                        if let Some(c) = active_conns[fd as usize].as_mut() {
                             match do_send(fd, c) {
-                                SendResult::Done    => {}
+                                SendResult::Done => {}
                                 SendResult::Partial => epoll_mod(epfd, fd, WRITE_FLAGS),
-                                SendResult::Error   => { drop_conn(epfd, fd, &mut conns); continue; }
+                                SendResult::Error => { 
+                                    let mut taken_conn = active_conns[fd as usize].take().unwrap();
+                                    taken_conn.reset();
+                                    conn_pool.push(taken_conn);
+                                    drop_conn(epfd, fd, &mut active_conns); 
+                                    continue; 
+                                }
                             }
                         }
                     }
@@ -174,11 +242,16 @@ pub fn run(sock_path: &str, model: &'static StaticIVF) {
             }
 
             if ev & libc::EPOLLOUT as u32 != 0 {
-                if let Some(c) = conns.get_mut(&fd) {
+                if let Some(c) = active_conns[fd as usize].as_mut() {
                     match do_send(fd, c) {
-                        SendResult::Done    => epoll_mod(epfd, fd, READ_FLAGS),
+                        SendResult::Done => epoll_mod(epfd, fd, READ_FLAGS),
                         SendResult::Partial => {}
-                        SendResult::Error   => { drop_conn(epfd, fd, &mut conns); }
+                        SendResult::Error => { 
+                            let mut taken_conn = active_conns[fd as usize].take().unwrap();
+                            taken_conn.reset();
+                            conn_pool.push(taken_conn);
+                            drop_conn(epfd, fd, &mut active_conns); 
+                        }
                     }
                 }
             }
@@ -186,6 +259,7 @@ pub fn run(sock_path: &str, model: &'static StaticIVF) {
     }
 }
 
+// Keep create_listener(path) unchanged...
 fn create_listener(path: &str) -> i32 {
     let fd = unsafe {
         libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)

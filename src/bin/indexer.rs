@@ -1,31 +1,33 @@
-use project::IVF::build_ivf;
+use project::tree;
 use project::loader::DataLoader;
+use project::types::RawData;
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+fn label_counts(data: &[RawData]) -> (usize, usize) {
+    let fraud = data.iter().filter(|d| d.label == "fraud").count();
+    (fraud, data.len() - fraud)
 }
 
 fn main() {
     let data_path  = std::env::var("DATA_PATH")
         .unwrap_or_else(|_| "resources/references.json.gz".to_string());
     let index_path = std::env::var("INDEX_PATH")
-        .unwrap_or_else(|_| "resources/index.ivf".to_string());
-
-    // Tunable via environment variables — rebuild index to change.
-    let k_centroids  = env_usize("K_CENTROIDS",  1024);
-    let nprobe       = env_usize("NPROBE",           4);
-    let k            = env_usize("K",                5);  // must match RESPONSES length
-    let kmeans_iters = env_usize("KMEANS_ITERS",    10);
+        .unwrap_or_else(|_| "resources/index.kdt".to_string());
 
     println!("Loading training data from {data_path}...");
     let t0 = std::time::Instant::now();
     let train_data = DataLoader::load_train_data(&data_path);
-    println!("Loaded {} records in {:.1}s", train_data.len(), t0.elapsed().as_secs_f64());
+    let (fraud, legit) = label_counts(&train_data);
+    println!(
+        "Loaded {} records in {:.1}s  (fraud={} {:.1}%, legit={} {:.1}%)",
+        train_data.len(), t0.elapsed().as_secs_f64(),
+        fraud, 100.0 * fraud as f64 / train_data.len() as f64,
+        legit, 100.0 * legit as f64 / train_data.len() as f64,
+    );
 
-    let model = build_ivf(k_centroids, nprobe, k, kmeans_iters, train_data);
+    println!("Building KD-tree index...");
+    let t1 = std::time::Instant::now();
+    let model = tree::build(train_data);
+    println!("Built in {:.1}s", t1.elapsed().as_secs_f64());
 
     println!("Saving index to {index_path}...");
     model.save(&index_path);

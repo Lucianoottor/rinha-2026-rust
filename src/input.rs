@@ -1,3 +1,6 @@
+﻿#![allow(unsafe_op_in_unsafe_fn)]
+use std::slice;
+
 pub struct Payload<'a> {
     pub amount: f32,
     pub installments: u32,
@@ -15,420 +18,421 @@ pub struct Payload<'a> {
     pub last_km: Option<f32>,
 }
 
-
 const K_ID: u64          = u64::from_le_bytes([b'i', b'd',  0,   0,   0,   0,   0,   0  ]);
 const K_TRANSACTION: u64 = u64::from_le_bytes([b't', b'r', b'a', b'n', b's', b'a', b'c', b't']);
 const K_CUSTOMER: u64    = u64::from_le_bytes([b'c', b'u', b's', b't', b'o', b'm', b'e', b'r']);
 const K_MERCHANT: u64    = u64::from_le_bytes([b'm', b'e', b'r', b'c', b'h', b'a', b'n', b't']);
 const K_TERMINAL: u64    = u64::from_le_bytes([b't', b'e', b'r', b'm', b'i', b'n', b'a', b'l']);
 const K_LAST_TX: u64     = u64::from_le_bytes([b'l', b'a', b's', b't', b'_', b't', b'r', b'a']);
-
 const K_AMOUNT: u64      = u64::from_le_bytes([b'a', b'm', b'o', b'u', b'n', b't',  0,   0  ]);
 const K_INSTALLM: u64    = u64::from_le_bytes([b'i', b'n', b's', b't', b'a', b'l', b'l', b'm']);
 const K_REQUESTED: u64   = u64::from_le_bytes([b'r', b'e', b'q', b'u', b'e', b's', b't', b'e']);
-
 const K_AVG_AMOUNT: u64  = u64::from_le_bytes([b'a', b'v', b'g', b'_', b'a', b'm', b'o', b'u']);
 const K_TX_COUNT: u64    = u64::from_le_bytes([b't', b'x', b'_', b'c', b'o', b'u', b'n', b't']);
 const K_KNOWN_MERCH: u64 = u64::from_le_bytes([b'k', b'n', b'o', b'w', b'n', b'_', b'm', b'e']);
-
 const K_MCC: u64         = u64::from_le_bytes([b'm', b'c', b'c',  0,   0,   0,   0,   0  ]);
-
 const K_IS_ONLINE: u64   = u64::from_le_bytes([b'i', b's', b'_', b'o', b'n', b'l', b'i', b'n']);
 const K_CARD_PRES: u64   = u64::from_le_bytes([b'c', b'a', b'r', b'd', b'_', b'p', b'r', b'e']);
 const K_KM_FROM: u64     = u64::from_le_bytes([b'k', b'm', b'_', b'f', b'r', b'o', b'm', b'_']);
-
 const K_TIMESTAMP: u64   = u64::from_le_bytes([b't', b'i', b'm', b'e', b's', b't', b'a', b'm']);
 
-#[inline(always)]
-fn has_byte(x: u64, needle: u8) -> bool {
-    let v = x ^ (0x0101_0101_0101_0101_u64.wrapping_mul(needle as u64));
-    v.wrapping_sub(0x0101_0101_0101_0101_u64) & !v & 0x8080_8080_8080_8080_u64 != 0
-}
-
+type Ptr = *const u8;
 
 #[inline(always)]
-fn key_hash(b: &[u8]) -> u64 {
-    let mut arr = [0u8; 8];
-    let n = b.len().min(8);
-    arr[..n].copy_from_slice(&b[..n]);
-    u64::from_le_bytes(arr)
+unsafe fn skip_ws(mut p: Ptr, end: Ptr) -> Ptr {
+    while p < end && *p <= b' ' {
+        p = p.add(1);
+    }
+    p
 }
 
-struct Scanner<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// For len >= 8 uses a single unaligned load; shorter keys use a zeroed buffer.
+#[inline(always)]
+unsafe fn key_hash(p: Ptr, len: usize) -> u64 {
+    if len >= 8 {
+        (p as *const u64).read_unaligned()
+    } else {
+        let mut arr = [0u8; 8];
+        std::ptr::copy_nonoverlapping(p, arr.as_mut_ptr(), len);
+        u64::from_le_bytes(arr)
+    }
 }
 
-impl<'a> Scanner<'a> {
-    #[inline] fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
-    #[inline] fn peek(&self) -> Option<u8> { self.buf.get(self.pos).copied() }
-
-    #[inline]
-    fn skip_ws(&mut self) {
-        let buf = self.buf;
-        let mut i = self.pos;
-        while i < buf.len() {
-            let b = buf[i];
-            if b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' { break; }
-            i += 1;
-        }
-        self.pos = i;
+/// p -> opening `"`.  Returns (hash, key_len, ptr_after_closing_`"`).
+#[inline(always)]
+unsafe fn scan_key(p: Ptr) -> (u64, usize, Ptr) {
+    let start = p.add(1);
+    let mut cur = start;
+    while *cur != b'"' {
+        cur = cur.add(1);
     }
+    let len = cur.offset_from(start) as usize;
+    (key_hash(start, len), len, cur.add(1))
+}
 
-    #[inline]
-    fn expect(&mut self, byte: u8) -> Option<()> {
-        if self.buf.get(self.pos).copied() == Some(byte) {
-            self.pos += 1;
-            Some(())
-        } else {
-            None
-        }
+/// p -> opening `"`.  Returns (content_slice, ptr_after_closing_`"`).
+#[inline(always)]
+unsafe fn scan_str<'a>(p: Ptr) -> (&'a [u8], Ptr) {
+    let start = p.add(1);
+    let mut cur = start;
+    loop {
+        let b = *cur;
+        if b == b'"' { break; }
+        if b == b'\\' { cur = cur.add(1); }
+        cur = cur.add(1);
     }
+    (slice::from_raw_parts(start, cur.offset_from(start) as usize), cur.add(1))
+}
 
-    #[inline]
-    fn scan_str_content(&mut self) -> Option<&'a [u8]> {
-        let buf = self.buf;
-        let start = self.pos;
-        let mut i = start;
+/// p -> first digit.  Returns (value, ptr_after).
+#[inline(always)]
+unsafe fn parse_u32(mut p: Ptr) -> (u32, Ptr) {
+    let mut n = 0u32;
+    loop {
+        let d = (*p).wrapping_sub(b'0');
+        if d > 9 { break; }
+        n = n.wrapping_mul(10).wrapping_add(d as u32);
+        p = p.add(1);
+    }
+    (n, p)
+}
 
-        while i + 8 <= buf.len() {
-            let chunk = unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() };
-            if has_byte(chunk, b'"') || has_byte(chunk, b'\\') {
-                break;
+/// p -> start of float literal.  Returns (value, ptr_after).
+#[inline(always)]
+unsafe fn parse_f32(p: Ptr, end: Ptr) -> (f32, Ptr) {
+    let remaining = slice::from_raw_parts(p, end.offset_from(p) as usize);
+    match fast_float::parse_partial::<f32, _>(remaining) {
+        Ok((v, n)) => (v, p.add(n)),
+        Err(_)     => (0.0, p),
+    }
+}
+
+/// p -> `t` or `f`.  Returns (value, ptr_after).
+#[inline(always)]
+unsafe fn parse_bool(p: Ptr) -> (bool, Ptr) {
+    if *p == b't' { (true, p.add(4)) } else { (false, p.add(5)) }
+}
+
+/// p -> opening `[`.  Returns (slice_including_brackets, ptr_after).
+#[inline(always)]
+unsafe fn slice_array<'a>(p: Ptr, end: Ptr) -> (&'a [u8], Ptr) {
+    let start = p;
+    let mut cur = p;
+    let mut depth = 0i32;
+    while cur < end {
+        let b = *cur;
+        cur = cur.add(1);
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 { break; }
             }
-            i += 8;
-        }
-
-        loop {
-            let b = *buf.get(i)?;
-            if b == b'"' {
-                self.pos = i + 1;
-                return Some(&buf[start..i]);
-            }
-            if b == b'\\' { i += 2; } else { i += 1; }
+            b'"' => loop {
+                let c = *cur;
+                cur = cur.add(1);
+                if c == b'"' { break; }
+                if c == b'\\' { cur = cur.add(1); }
+            },
+            _ => {}
         }
     }
+    (slice::from_raw_parts(start, cur.offset_from(start) as usize), cur)
+}
 
-    #[inline]
-    fn read_str(&mut self) -> Option<&'a [u8]> {
-        self.expect(b'"')?;
-        self.scan_str_content()
-    }
-    #[inline]
-    fn read_key(&mut self) -> Option<(u64, usize)> {
-        self.expect(b'"')?;
-        let content = self.scan_str_content()?;
-        Some((key_hash(content), content.len()))
-    }
-
-    #[inline]
-    fn parse_u32(&mut self) -> Option<u32> {
-        let mut n = 0u32;
-        let mut hit = false;
-        while let Some(b @ b'0'..=b'9') = self.peek() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
-            self.pos += 1;
-            hit = true;
-        }
-        hit.then_some(n)
-    }
-
-    #[inline]
-    fn parse_f32(&mut self) -> Option<f32> {
-        let (val, consumed) = fast_float::parse_partial::<f32, _>(&self.buf[self.pos..]).ok()?;
-        self.pos += consumed;
-        Some(val)
-    }
-
-    #[inline]
-    fn parse_bool(&mut self) -> Option<bool> {
-        match self.peek()? {
-            b't' => { self.pos += 4; Some(true)  }
-            b'f' => { self.pos += 5; Some(false) }
-            _    => None,
-        }
-    }
-
-    #[inline]
-    fn try_null(&mut self) -> bool {
-        if self.peek() == Some(b'n') { self.pos += 4; true } else { false }
-    }
-
-    fn slice_array(&mut self) -> Option<&'a [u8]> {
-        let start = self.pos;
-        self.skip_array()?;
-        Some(&self.buf[start..self.pos])
-    }
-
-    fn skip_array(&mut self) -> Option<()> {
-        self.expect(b'[')?;
-        self.skip_ws();
-        if self.peek() == Some(b']') { self.pos += 1; return Some(()); }
-        loop {
-            self.skip_ws();
-            self.skip_value()?;
-            self.skip_ws();
-            match self.peek()? {
-                b']' => { self.pos += 1; return Some(()); }
-                b',' => { self.pos += 1; }
-                _    => return None,
+/// p -> start of any JSON value.  Returns ptr_after without allocating.
+#[inline(always)]
+unsafe fn skip_value(p: Ptr, end: Ptr) -> Ptr {
+    match *p {
+        b'"' => {
+            let mut cur = p.add(1);
+            loop {
+                let b = *cur;
+                cur = cur.add(1);
+                if b == b'"' { return cur; }
+                if b == b'\\' { cur = cur.add(1); }
             }
         }
-    }
-
-    fn skip_object(&mut self) -> Option<()> {
-        self.expect(b'{')?;
-        self.skip_ws();
-        if self.peek() == Some(b'}') { self.pos += 1; return Some(()); }
-        loop {
-            self.skip_ws();
-            self.expect(b'"')?;
-            self.scan_str_content()?;
-            self.skip_ws();
-            self.expect(b':')?;
-            self.skip_ws();
-            self.skip_value()?;
-            self.skip_ws();
-            match self.peek()? {
-                b'}' => { self.pos += 1; return Some(()); }
-                b',' => { self.pos += 1; }
-                _    => return None,
-            }
-        }
-    }
-
-    fn skip_value(&mut self) -> Option<()> {
-        self.skip_ws();
-        match self.peek()? {
-            b'"' => { self.pos += 1; self.scan_str_content()?; }
-            b'{' => { self.skip_object()?; }
-            b'[' => { self.skip_array()?; }
-            b't' => { self.pos += 4; } // true
-            b'f' => { self.pos += 5; } // false
-            b'n' => { self.pos += 4; } // null
-            _    => {
-                // number
-                while matches!(self.peek(), Some(b'-' | b'+' | b'0'..=b'9' | b'.' | b'e' | b'E')) {
-                    self.pos += 1;
+        b'{' => {
+            let mut cur = p.add(1);
+            let mut depth = 1i32;
+            while cur < end {
+                let b = *cur;
+                cur = cur.add(1);
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => { depth -= 1; if depth == 0 { return cur; } }
+                    b'"' => loop {
+                        let c = *cur;
+                        cur = cur.add(1);
+                        if c == b'"' { break; }
+                        if c == b'\\' { cur = cur.add(1); }
+                    },
+                    _ => {}
                 }
             }
+            cur
         }
-        Some(())
-    }
-
- 
-    fn parse_transaction(&mut self) -> Option<(f32, u32, &'a [u8])> {
-        self.expect(b'{')?;
-        let mut amount = None::<f32>;
-        let mut installments = None::<u32>;
-        let mut requested_at = None::<&[u8]>;
-        loop {
-            self.skip_ws();
-            match self.peek()? {
-                b'}' => { self.pos += 1; break; }
-                b',' => { self.pos += 1; continue; }
-                b'"' => {}
-                _    => return None,
-            }
-            let (h, klen) = self.read_key()?;
-            self.skip_ws(); self.expect(b':')?; self.skip_ws();
-
-            match (h, klen) {
-                (K_AMOUNT,     6)  => amount       = Some(self.parse_f32()?),
-                (K_INSTALLM,   12) => installments = Some(self.parse_u32()?),
-                (K_REQUESTED,  12) => requested_at = Some(self.read_str()?),
-                _                  => { self.skip_value()?; }
-            }
+        b'[' => {
+            let (_, after) = slice_array(p, end);
+            after
         }
-        Some((amount?, installments?, requested_at?))
-    }
-
-    fn parse_customer(&mut self) -> Option<(f32, u32, &'a [u8])> {
-        self.expect(b'{')?;
-        let mut avg_amount = None::<f32>;
-        let mut tx_count = None::<u32>;
-        let mut known_merchants = None::<&[u8]>;
-        loop {
-            self.skip_ws();
-            match self.peek()? {
-                b'}' => { self.pos += 1; break; }
-                b',' => { self.pos += 1; continue; }
-                b'"' => {}
-                _    => return None,
+        b't' => p.add(4),
+        b'f' => p.add(5),
+        b'n' => p.add(4),
+        _ => {
+            let mut cur = p;
+            while cur < end {
+                let b = *cur;
+                if b == b',' || b == b'}' || b == b']' || b <= b' ' { break; }
+                cur = cur.add(1);
             }
-            let (h, klen) = self.read_key()?;
-            self.skip_ws(); self.expect(b':')?; self.skip_ws();
-            match (h, klen) {
-                (K_AVG_AMOUNT,  10) => avg_amount      = Some(self.parse_f32()?),
-                (K_TX_COUNT,    12) => tx_count         = Some(self.parse_u32()?),
-                (K_KNOWN_MERCH, 15) => known_merchants  = Some(self.slice_array()?),
-                _                   => { self.skip_value()?; }
-            }
+            cur
         }
-        Some((avg_amount?, tx_count?, known_merchants?))
-    }
-
-    fn parse_merchant(&mut self) -> Option<(&'a [u8], &'a [u8], f32)> {
-        self.expect(b'{')?;
-        let mut id = None::<&[u8]>;
-        let mut mcc = None::<&[u8]>;
-        let mut avg_amount = None::<f32>;
-        loop {
-            self.skip_ws();
-            match self.peek()? {
-                b'}' => { self.pos += 1; break; }
-                b',' => { self.pos += 1; continue; }
-                b'"' => {}
-                _    => return None,
-            }
-            let (h, klen) = self.read_key()?;
-            self.skip_ws(); self.expect(b':')?; self.skip_ws();
-            match (h, klen) {
-                (K_ID,         2)  => id         = Some(self.read_str()?),
-                (K_MCC,        3)  => mcc        = Some(self.read_str()?),
-                (K_AVG_AMOUNT, 10) => avg_amount = Some(self.parse_f32()?),
-                _                  => { self.skip_value()?; }
-            }
-        }
-        Some((id?, mcc?, avg_amount?))
-    }
-
-    fn parse_terminal(&mut self) -> Option<(bool, bool, f32)> {
-        self.expect(b'{')?;
-        let mut is_online = None::<bool>;
-        let mut card_present = None::<bool>;
-        let mut km_from_home = None::<f32>;
-        loop {
-            self.skip_ws();
-            match self.peek()? {
-                b'}' => { self.pos += 1; break; }
-                b',' => { self.pos += 1; continue; }
-                b'"' => {}
-                _    => return None,
-            }
-            let (h, klen) = self.read_key()?;
-            self.skip_ws(); self.expect(b':')?; self.skip_ws();
-            match (h, klen) {
-                (K_IS_ONLINE,  9)  => is_online    = Some(self.parse_bool()?),
-                (K_CARD_PRES,  12) => card_present = Some(self.parse_bool()?),
-                (K_KM_FROM,    12) => km_from_home = Some(self.parse_f32()?),
-                _                  => { self.skip_value()?; }
-            }
-        }
-        Some((is_online?, card_present?, km_from_home?))
-    }
-
-    fn parse_last_tx(&mut self) -> Option<(&'a [u8], f32)> {
-        self.expect(b'{')?;
-        let mut timestamp = None::<&[u8]>;
-        let mut km = None::<f32>;
-        loop {
-            self.skip_ws();
-            match self.peek()? {
-                b'}' => { self.pos += 1; break; }
-                b',' => { self.pos += 1; continue; }
-                b'"' => {}
-                _    => return None,
-            }
-            let (h, klen) = self.read_key()?;
-            self.skip_ws(); self.expect(b':')?; self.skip_ws();
-            match (h, klen) {
-                (K_TIMESTAMP, 9)  => timestamp = Some(self.read_str()?),
-                (K_KM_FROM,   15) => km        = Some(self.parse_f32()?),
-                _                 => { self.skip_value()?; }
-            }
-        }
-        Some((timestamp?, km?))
     }
 }
+#[inline(always)]
+unsafe fn parse_transaction<'a>(
+    mut p: Ptr, end: Ptr,
+) -> Option<(f32, u32, &'a [u8], Ptr)> {
+    p = p.add(1);
+    let mut amount       = None::<f32>;
+    let mut installments = None::<u32>;
+    let mut requested_at = None::<&[u8]>;
+    loop {
+        p = skip_ws(p, end);
+        match *p {
+            b'}' => { p = p.add(1); break; }
+            b',' => { p = p.add(1); continue; }
+            _    => {}
+        }
+        let (h, klen, ak) = scan_key(p);
+        p = skip_ws(ak, end);
+        p = p.add(1);
+        p = skip_ws(p, end);
+        match (h, klen) {
+            (K_AMOUNT,    6)  => { let (v, q) = parse_f32(p, end); amount       = Some(v); p = q; }
+            (K_INSTALLM,  12) => { let (v, q) = parse_u32(p);      installments = Some(v); p = q; }
+            (K_REQUESTED, 12) => { let (v, q) = scan_str(p);       requested_at = Some(v); p = q; }
+            _                 => { p = skip_value(p, end); }
+        }
+    }
+    Some((amount?, installments?, requested_at?, p))
+}
 
+#[inline(always)]
+unsafe fn parse_customer<'a>(
+    mut p: Ptr, end: Ptr,
+) -> Option<(f32, u32, &'a [u8], Ptr)> {
+    p = p.add(1);
+    let mut avg_amount      = None::<f32>;
+    let mut tx_count        = None::<u32>;
+    let mut known_merchants = None::<&[u8]>;
+    loop {
+        p = skip_ws(p, end);
+        match *p {
+            b'}' => { p = p.add(1); break; }
+            b',' => { p = p.add(1); continue; }
+            _    => {}
+        }
+        let (h, klen, ak) = scan_key(p);
+        p = skip_ws(ak, end);
+        p = p.add(1);
+        p = skip_ws(p, end);
+        match (h, klen) {
+            (K_AVG_AMOUNT,  10) => { let (v, q) = parse_f32(p, end);   avg_amount      = Some(v); p = q; }
+            (K_TX_COUNT,    12) => { let (v, q) = parse_u32(p);        tx_count        = Some(v); p = q; }
+            (K_KNOWN_MERCH, 15) => { let (v, q) = slice_array(p, end); known_merchants = Some(v); p = q; }
+            _                   => { p = skip_value(p, end); }
+        }
+    }
+    Some((avg_amount?, tx_count?, known_merchants?, p))
+}
+
+#[inline(always)]
+unsafe fn parse_merchant<'a>(
+    mut p: Ptr, end: Ptr,
+) -> Option<(&'a [u8], &'a [u8], f32, Ptr)> {
+    p = p.add(1);
+    let mut id         = None::<&[u8]>;
+    let mut mcc        = None::<&[u8]>;
+    let mut avg_amount = None::<f32>;
+    loop {
+        p = skip_ws(p, end);
+        match *p {
+            b'}' => { p = p.add(1); break; }
+            b',' => { p = p.add(1); continue; }
+            _    => {}
+        }
+        let (h, klen, ak) = scan_key(p);
+        p = skip_ws(ak, end);
+        p = p.add(1);
+        p = skip_ws(p, end);
+        match (h, klen) {
+            (K_ID,         2)  => { let (v, q) = scan_str(p);       id         = Some(v); p = q; }
+            (K_MCC,        3)  => { let (v, q) = scan_str(p);       mcc        = Some(v); p = q; }
+            (K_AVG_AMOUNT, 10) => { let (v, q) = parse_f32(p, end); avg_amount = Some(v); p = q; }
+            _                  => { p = skip_value(p, end); }
+        }
+    }
+    Some((id?, mcc?, avg_amount?, p))
+}
+
+#[inline(always)]
+unsafe fn parse_terminal(mut p: Ptr, end: Ptr) -> Option<(bool, bool, f32, Ptr)> {
+    p = p.add(1);
+    let mut is_online    = None::<bool>;
+    let mut card_present = None::<bool>;
+    let mut km_from_home = None::<f32>;
+    loop {
+        p = skip_ws(p, end);
+        match *p {
+            b'}' => { p = p.add(1); break; }
+            b',' => { p = p.add(1); continue; }
+            _    => {}
+        }
+        let (h, klen, ak) = scan_key(p);
+        p = skip_ws(ak, end);
+        p = p.add(1);
+        p = skip_ws(p, end);
+        match (h, klen) {
+            (K_IS_ONLINE, 9)  => { let (v, q) = parse_bool(p);     is_online    = Some(v); p = q; }
+            (K_CARD_PRES, 12) => { let (v, q) = parse_bool(p);     card_present = Some(v); p = q; }
+            (K_KM_FROM,   12) => { let (v, q) = parse_f32(p, end); km_from_home = Some(v); p = q; }
+            _                 => { p = skip_value(p, end); }
+        }
+    }
+    Some((is_online?, card_present?, km_from_home?, p))
+}
+
+#[inline(always)]
+unsafe fn parse_last_tx<'a>(mut p: Ptr, end: Ptr) -> Option<(&'a [u8], f32, Ptr)> {
+    p = p.add(1);
+    let mut timestamp = None::<&[u8]>;
+    let mut km        = None::<f32>;
+    loop {
+        p = skip_ws(p, end);
+        match *p {
+            b'}' => { p = p.add(1); break; }
+            b',' => { p = p.add(1); continue; }
+            _    => {}
+        }
+        let (h, klen, ak) = scan_key(p);
+        p = skip_ws(ak, end);
+        p = p.add(1);
+        p = skip_ws(p, end);
+        match (h, klen) {
+            (K_TIMESTAMP, 9)  => { let (v, q) = scan_str(p);       timestamp = Some(v); p = q; }
+            (K_KM_FROM,   15) => { let (v, q) = parse_f32(p, end); km        = Some(v); p = q; }
+            _                 => { p = skip_value(p, end); }
+        }
+    }
+    Some((timestamp?, km?, p))
+}
 
 pub fn parse_payload(req_body: &[u8]) -> Option<Payload<'_>> {
-    let mut s = Scanner::new(req_body);
-    s.skip_ws();
-    s.expect(b'{')?;
+    if req_body.len() < 2 { return None; }
 
-    let mut amount           = None::<f32>;
-    let mut installments     = None::<u32>;
-    let mut requested_at     = None::<&[u8]>;
-    let mut customer_avg     = None::<f32>;
-    let mut tx_count_24h     = None::<u32>;
-    let mut known_merchants  = None::<&[u8]>;
-    let mut merchant_id      = None::<&[u8]>;
-    let mut merchant_mcc     = None::<&[u8]>;
-    let mut merchant_avg     = None::<f32>;
-    let mut is_online        = None::<bool>;
-    let mut card_present     = None::<bool>;
-    let mut km_from_home     = None::<f32>;
-    let mut last_timestamp   = None::<&[u8]>;
-    let mut last_km          = None::<f32>;
+    unsafe {
+        let base = req_body.as_ptr();
+        let end  = base.add(req_body.len());
 
-    loop {
-        s.skip_ws();
-        match s.peek()? {
-            b'}' => { s.pos += 1; break; }
-            b',' => { s.pos += 1; continue; }
-            b'"' => {}
-            _    => return None,
-        }
-        let (h, klen) = s.read_key()?;
-        s.skip_ws(); s.expect(b':')?; s.skip_ws();
+        let mut p = skip_ws(base, end);
+        if *p != b'{' { return None; }
+        p = p.add(1);
 
-        match (h, klen) {
-            (K_ID,          2)  => { s.read_str()?; }
-            (K_TRANSACTION, 11) => {
-                let (a, inst, rat) = s.parse_transaction()?;
-                amount       = Some(a);
-                installments = Some(inst);
-                requested_at = Some(rat);
+        let mut amount          = None::<f32>;
+        let mut installments    = None::<u32>;
+        let mut requested_at    = None::<&[u8]>;
+        let mut customer_avg    = None::<f32>;
+        let mut tx_count_24h    = None::<u32>;
+        let mut known_merchants = None::<&[u8]>;
+        let mut merchant_id     = None::<&[u8]>;
+        let mut merchant_mcc    = None::<&[u8]>;
+        let mut merchant_avg    = None::<f32>;
+        let mut is_online       = None::<bool>;
+        let mut card_present    = None::<bool>;
+        let mut km_from_home    = None::<f32>;
+        let mut last_timestamp  = None::<&[u8]>;
+        let mut last_km         = None::<f32>;
+
+        loop {
+            p = skip_ws(p, end);
+            match *p {
+                b'}' => { p = p.add(1); break; }
+                b',' => { p = p.add(1); continue; }
+                _    => {}
             }
-            (K_CUSTOMER, 8) => {
-                let (avg, cnt, km) = s.parse_customer()?;
-                customer_avg    = Some(avg);
-                tx_count_24h    = Some(cnt);
-                known_merchants = Some(km);
-            }
-            (K_MERCHANT, 8) => {
-                let (mid, mcc, mavg) = s.parse_merchant()?;
-                merchant_id  = Some(mid);
-                merchant_mcc = Some(mcc);
-                merchant_avg = Some(mavg);
-            }
-            (K_TERMINAL, 8) => {
-                let (online, card, km) = s.parse_terminal()?;
-                is_online    = Some(online);
-                card_present = Some(card);
-                km_from_home = Some(km);
-            }
-            (K_LAST_TX, 16) => {
-                if !s.try_null() {
-                    let (ts, km) = s.parse_last_tx()?;
-                    last_timestamp = Some(ts);
-                    last_km        = Some(km);
+            let (h, klen, ak) = scan_key(p);
+            p = skip_ws(ak, end);
+            p = p.add(1);
+            p = skip_ws(p, end);
+
+            match (h, klen) {
+                (K_ID, 2) => {
+                    let (_, q) = scan_str(p);
+                    p = q;
                 }
+                (K_TRANSACTION, 11) => {
+                    let (a, inst, rat, q) = parse_transaction(p, end)?;
+                    amount       = Some(a);
+                    installments = Some(inst);
+                    requested_at = Some(rat);
+                    p = q;
+                }
+                (K_CUSTOMER, 8) => {
+                    let (avg, cnt, km, q) = parse_customer(p, end)?;
+                    customer_avg    = Some(avg);
+                    tx_count_24h    = Some(cnt);
+                    known_merchants = Some(km);
+                    p = q;
+                }
+                (K_MERCHANT, 8) => {
+                    let (mid, mcc, mavg, q) = parse_merchant(p, end)?;
+                    merchant_id  = Some(mid);
+                    merchant_mcc = Some(mcc);
+                    merchant_avg = Some(mavg);
+                    p = q;
+                }
+                (K_TERMINAL, 8) => {
+                    let (online, card, km, q) = parse_terminal(p, end)?;
+                    is_online    = Some(online);
+                    card_present = Some(card);
+                    km_from_home = Some(km);
+                    p = q;
+                }
+                (K_LAST_TX, 16) => {
+                    if *p == b'n' {
+                        p = p.add(4);
+                    } else {
+                        let (ts, km, q) = parse_last_tx(p, end)?;
+                        last_timestamp = Some(ts);
+                        last_km        = Some(km);
+                        p = q;
+                    }
+                }
+                _ => { p = skip_value(p, end); }
             }
-            _ => { s.skip_value()?; }
         }
+
+        Some(Payload {
+            amount:              amount?,
+            installments:        installments?,
+            requested_at:        requested_at?,
+            customer_avg_amount: customer_avg?,
+            tx_count_24h:        tx_count_24h?,
+            known_merchants:     known_merchants?,
+            merchant_id:         merchant_id?,
+            merchant_mcc:        merchant_mcc?,
+            merchant_avg_amount: merchant_avg?,
+            is_online:           is_online?,
+            card_present:        card_present?,
+            km_from_home:        km_from_home?,
+            last_timestamp,
+            last_km,
+        })
     }
-
-    Some(Payload {
-        amount:              amount?,
-        installments:        installments?,
-        requested_at:        requested_at?,
-        customer_avg_amount: customer_avg?,
-        tx_count_24h:        tx_count_24h?,
-        known_merchants:     known_merchants?,
-        merchant_id:         merchant_id?,
-        merchant_mcc:        merchant_mcc?,
-        merchant_avg_amount: merchant_avg?,
-        is_online:           is_online?,
-        card_present:        card_present?,
-        km_from_home:        km_from_home?,
-        last_timestamp,
-        last_km,
-    })
 }
-
 
 #[cfg(test)]
 mod tests {
