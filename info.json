@@ -5,6 +5,6 @@
         "https://br.linkedin.com/in/luciano-otto"
     ],
     "source-code-repo": "https://github.com/Lucianoottor/rinha-2026-rust",
-    "stack": ["Rust", "Nginx", "monoio"],
+    "stack": ["Rust", "haproxy"],
     "open_to_work": true
 }
