@@ -16,7 +16,7 @@ services:
       resources:
         limits:
           cpus: "0.4"
-          memory: "165M"
+          memory: "160M"
 
   api-2:
     platform: linux/amd64
@@ -35,7 +35,7 @@ services:
       resources:
         limits:
           cpus: "0.4"
-          memory: "165M"
+          memory: "160M"
 
   acceptor:
     platform: linux/amd64
@@ -64,7 +64,7 @@ services:
       resources:
         limits:
           cpus: "0.2"
-          memory: "20M"
+          memory: "30M"
 
 volumes:
   sockets:
