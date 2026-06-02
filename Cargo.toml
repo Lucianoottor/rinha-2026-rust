@@ -13,6 +13,22 @@ memmap2 = "0.9"
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
 
+[[bin]]
+name = "project"
+path = "src/main.rs"
+
+[[bin]]
+name = "acceptor"
+path = "src/bin/acceptor.rs"
+
+[[bin]]
+name = "healthcheck"
+path = "src/bin/healthcheck.rs"
+
+[[bin]]
+name = "indexer"
+path = "src/bin/indexer.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

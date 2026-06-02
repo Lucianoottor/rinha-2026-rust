@@ -1,5 +1,6 @@
 use libc;
 use std::os::unix::io::RawFd;
+use std::sync::{Arc, Mutex};
 
 use crate::input;
 use crate::normalizer::DataNormalizer;
@@ -150,18 +151,17 @@ fn do_send(fd: i32, conn: &mut Conn) -> SendResult {
     SendResult::Done
 }
 
-pub fn run(sock_path: &str, model: &'static TreeIndex) {
+pub fn run(sock_path: &str, model: &'static TreeIndex, notify_rx: RawFd, fd_queue: Arc<Mutex<Vec<RawFd>>>) {
     let lfd = create_listener(sock_path);
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epfd >= 0);
     epoll_add(epfd, lfd, libc::EPOLLIN as u32);
+    epoll_add(epfd, notify_rx, libc::EPOLLIN as u32);
 
-    // PRE-ALLOCATED STORAGE: Memory footprint is bounded and deterministic right at startup
     let mut conns: Vec<Option<Conn>> = (0..MAX_FDS)
         .map(|_| Some(Conn::with_capacity(BUF_CAP)))
         .collect();
-        
-    // Initially set all slots to None while preserving their inner capacity structures
+
     let mut conn_pool: Vec<Conn> = conns.drain(..).filter_map(|c| c).collect();
     let mut active_conns: Vec<Option<Conn>> = (0..MAX_FDS).map(|_| None).collect();
 
@@ -174,6 +174,23 @@ pub fn run(sock_path: &str, model: &'static TreeIndex) {
         for i in 0..n as usize {
             let fd = events[i].u64 as i32;
             let ev = events[i].events;
+
+            if fd == notify_rx {
+                let mut tmp = [0u8; 64];
+                unsafe { libc::recv(notify_rx, tmp.as_mut_ptr() as *mut _, 64, 0) };
+                let injected: Vec<RawFd> = fd_queue.lock().unwrap().drain(..).collect();
+                for ifd in injected {
+                    if ifd as usize >= MAX_FDS { unsafe { libc::close(ifd) }; continue; }
+                    if let Some(mut conn) = conn_pool.pop() {
+                        conn.reset();
+                        active_conns[ifd as usize] = Some(conn);
+                        epoll_add(epfd, ifd, READ_FLAGS);
+                    } else {
+                        unsafe { libc::close(ifd) };
+                    }
+                }
+                continue;
+            }
 
             if fd == lfd {
                 loop {
