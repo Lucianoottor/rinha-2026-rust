@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::input;
 use crate::normalizer::DataNormalizer;
 use crate::server::{parse_content_length, RESP_400, RESP_READY, RESPONSES};
-use crate::tree::TreeIndex;
+use crate::IVF::StaticIVF;
 
 
 const MAX_FDS: usize = 4096;
@@ -37,7 +37,7 @@ impl Conn {
         self.written = 0;
     }
     #[inline(always)]
-    fn process(&mut self, model: &TreeIndex) -> bool {
+    fn process(&mut self, model: &StaticIVF) -> bool {
         let raw = &self.rbuf[..self.filled];
 
         if raw.starts_with(b"GET /ready") {
@@ -103,7 +103,7 @@ fn drop_conn(epfd: i32, fd: i32, conns: &mut [Option<Conn>]) {
     }
 }
 
-fn do_read(fd: i32, conns: &mut [Option<Conn>], model: &TreeIndex) -> ReadResult {
+fn do_read(fd: i32, conns: &mut [Option<Conn>], model: &StaticIVF) -> ReadResult {
     // O(1) direct index lookup instead of a hashing function
     let conn = match conns.get_mut(fd as usize).and_then(|c| c.as_mut()) {
         Some(c) => c,
@@ -151,7 +151,7 @@ fn do_send(fd: i32, conn: &mut Conn) -> SendResult {
     SendResult::Done
 }
 
-pub fn run(sock_path: &str, model: &'static TreeIndex, notify_rx: RawFd, fd_queue: Arc<Mutex<Vec<RawFd>>>) {
+pub fn run(sock_path: &str, model: &'static StaticIVF, notify_rx: RawFd, fd_queue: Arc<Mutex<Vec<RawFd>>>) {
     let lfd = create_listener(sock_path);
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epfd >= 0);

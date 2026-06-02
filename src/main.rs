@@ -1,5 +1,5 @@
 use project::fd;
-use project::tree::TreeIndex;
+use project::IVF::StaticIVF;
 use project::event_loop;
 
 use std::os::unix::io::{IntoRawFd, RawFd};
@@ -11,11 +11,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let index_path = std::env::var("INDEX_PATH")
-        .unwrap_or_else(|_| "resources/index.kdt".to_string());
+        .unwrap_or_else(|_| "resources/index.ivf".to_string());
 
-    let model = Box::new(TreeIndex::load(&index_path));
-    model.pretouch();
-    let model: &'static TreeIndex = Box::leak(model);
+    let model = Box::new(StaticIVF::load(&index_path));
+    model.prefetch();
+    let model: &'static StaticIVF = Box::leak(model);
 
     let sock_path = std::env::var("SOCK_PATH")
         .unwrap_or_else(|_| "/tmp/api.sock".to_string());
