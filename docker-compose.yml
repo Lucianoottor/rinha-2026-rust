@@ -7,7 +7,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD", "sh", "-c", "test -S /sockets/api1.sock"]
+      test: ["CMD", "./healthcheck"]
       interval: 1s
       timeout: 2s
       retries: 15
@@ -26,7 +26,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD", "sh", "-c", "test -S /sockets/api2.sock"]
+      test: ["CMD", "./healthcheck"]
       interval: 1s
       timeout: 2s
       retries: 15
@@ -50,6 +50,12 @@ services:
         condition: service_healthy
       api-2:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/9999'"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
     deploy:
       resources:
         limits:

@@ -434,15 +434,12 @@ impl TreeIndex {
 
         if self.roots[key] < 0 { return 0; }
 
-        let root    = self.roots[key] as usize;
-        let nodes   = &self.nodes  [self.node_off[key] .. self.node_off[key + 1]];
-        let vectors = &self.vectors[self.vec_off[key]  .. self.vec_off[key  + 1]];
-        let labels  = &self.labels [self.lbl_off[key]  .. self.lbl_off[key  + 1]];
+        let root = self.roots[key] as usize;
 
         let mut best_dists  = [i64::MAX; K];
         let mut best_labels = [0u8; K];
 
-        search(root, nodes, vectors, labels, &q, &mut best_dists, &mut best_labels);
+        search(root, &self.nodes, &self.vectors, &self.labels, &q, &mut best_dists, &mut best_labels);
 
         best_labels.iter().filter(|&&l| l != 0).count()
     }
