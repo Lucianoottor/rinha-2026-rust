@@ -7,7 +7,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD-SHELL", "./healthcheck && test -S ${SOCK_PATH}.ctrl"]
+      test: ["CMD-SHELL", "./healthcheck && test -S $$SOCK_PATH.ctrl"]
       interval: 1s
       timeout: 2s
       retries: 15
@@ -26,7 +26,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD-SHELL", "./healthcheck && test -S ${SOCK_PATH}.ctrl"]
+      test: ["CMD-SHELL", "./healthcheck && test -S $$SOCK_PATH.ctrl"]
       interval: 1s
       timeout: 2s
       retries: 15
