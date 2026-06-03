@@ -104,33 +104,31 @@ fn drop_conn(epfd: i32, fd: i32, conns: &mut [Option<Conn>]) {
 }
 
 fn do_read(fd: i32, conns: &mut [Option<Conn>], model: &StaticIVF) -> ReadResult {
-    // O(1) direct index lookup instead of a hashing function
     let conn = match conns.get_mut(fd as usize).and_then(|c| c.as_mut()) {
         Some(c) => c,
         None => return ReadResult::Close,
     };
 
-    // REMOVED internal loop: Read only once per epoll trigger to avoid stalling other sockets
-    let room = conn.rbuf.len() - conn.filled;
-    if room == 0 {
-        // Buffer full but request still incomplete: payload exceeds BUF_CAP capacity
-        return ReadResult::Close;
-    }
+    // Drain all available bytes per epoll event — avoids a second round-trip for
+    // requests that arrive in two writes (headers then body via TCP segmentation).
+    loop {
+        let room = conn.rbuf.len() - conn.filled;
+        if room == 0 { return ReadResult::Close; }
 
-    let n = unsafe {
-        libc::recv(fd, conn.rbuf[conn.filled..].as_mut_ptr() as *mut _, room, 0)
-    };
+        let n = unsafe {
+            libc::recv(fd, conn.rbuf[conn.filled..].as_mut_ptr() as *mut _, room, libc::MSG_DONTWAIT)
+        };
 
-    if n > 0 {
-        conn.filled += n as usize;
-        if conn.process(model) { return ReadResult::Respond; }
-        ReadResult::Wait
-    } else if n == 0 {
-        ReadResult::Close
-    } else {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock { return ReadResult::Wait; }
-        ReadResult::Close
+        if n > 0 {
+            conn.filled += n as usize;
+            if conn.process(model) { return ReadResult::Respond; }
+        } else if n == 0 {
+            return ReadResult::Close;
+        } else {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock { return ReadResult::Wait; }
+            return ReadResult::Close;
+        }
     }
 }
 
